@@ -3,7 +3,8 @@
  * @description Manages Three.js Scene, PerspectiveCamera, WebGLRenderer, Lighting,
  * MapControls, Raycaster, Grid Snapping Cursor, Drag-to-Zone Overlay,
  * Phase 3 Procedural Evolution (RCI), Phase 4 Road Networks & Auto-Tiling (Bitmasking),
- * and Phase 5 Web Worker A* Pathfinding & Vehicle Agents.
+ * Phase 5 Web Worker A* Pathfinding, Phase 6 UI Integration, and
+ * Phase 7 Left-Hand Traffic Lane Offsets, CatmullRomCurve3 Cornering & V2V Collision Avoidance.
  */
 
 import * as THREE from 'three';
@@ -32,17 +33,20 @@ export class Renderer {
     this.dragEndGrid = { x: 0, z: 0 };
     this.currentTool = 'residential'; // 'residential' | 'road' | 'bulldozer'
 
-    // Reusable objects for matrix composition and raycasting
+    // Reusable objects for matrix composition, curve evaluation, and V2V collision checks
     this.raycaster = new THREE.Raycaster();
     this.mouse = new THREE.Vector2();
     this.dummyTransform = new THREE.Object3D();
     this._buildingColor = new THREE.Color();
     this._roadColor = new THREE.Color();
-    this._moveDirection = new THREE.Vector3();
+    this._lookAtTarget = new THREE.Vector3();
+    this._toOtherVehicle = new THREE.Vector3();
 
-    // Phase 5: Vehicle Agent tracking and constants
+    // Phase 5 & Phase 7: Vehicle Agent tracking, LHT lane offset, and V2V constants
     this.activeVehicles = [];
     this.maxVehicles = 100;
+    this.laneOffset = 0.25 * GRID_SIZE; // Left-Hand Traffic (LHT) perpendicular offset
+    this.safeFollowingDistance = 0.8 * GRID_SIZE; // V2V braking distance threshold
     this._nextVehicleId = 1;
     this._clock = new THREE.Clock();
     this._vehiclePalette = [
@@ -83,7 +87,7 @@ export class Renderer {
     this._initInstanceManagers();
     this._initPathfindingWorker();
 
-    // Register DOM event listeners (temporary R/Z/X keydown listener removed in Phase 6)
+    // Register DOM event listeners
     window.addEventListener('resize', this.onWindowResize);
     this.canvas.addEventListener('mousemove', this.onMouseMove);
     this.canvas.addEventListener('mousedown', this.onMouseDown);
@@ -191,7 +195,6 @@ export class Renderer {
    * @private
    */
   _initGridAndGround() {
-    // Visual Grid Helper
     this.gridHelper = new THREE.GridHelper(
       this.worldSize,
       GRID_DIMENSIONS,
@@ -200,7 +203,6 @@ export class Renderer {
     );
     this.scene.add(this.gridHelper);
 
-    // Invisible ground plane for raycasting
     const planeGeometry = new THREE.PlaneGeometry(this.worldSize, this.worldSize);
     planeGeometry.rotateX(-Math.PI / 2);
 
@@ -216,7 +218,7 @@ export class Renderer {
    * Initializes separate `InstanceManager` instances for:
    * 1. `this.buildingManager` (RCI buildings)
    * 2. `this.roadManager` (flat 1 x 0.05 x 1 road segments)
-   * 3. `this.vehicleManager` (0.4 x 0.2 x 0.8 vehicle agents)
+   * 3. `this.vehicleManager` (0.32 x 0.2 x 0.65 vehicle agents sized cleanly for dual lanes)
    * @private
    */
   _initInstanceManagers() {
@@ -240,8 +242,8 @@ export class Renderer {
       roadMaterial
     );
 
-    // 3. Vehicle InstanceManager (0.4 width x 0.2 height x 0.8 length along Z-axis so lookAt points the car head along the path)
-    const vehicleGeometry = new THREE.BoxGeometry(0.4, 0.2, 0.8);
+    // 3. Vehicle InstanceManager (0.32 width x 0.2 height x 0.65 length so opposing lanes never clip)
+    const vehicleGeometry = new THREE.BoxGeometry(0.32, 0.2, 0.65);
     vehicleGeometry.translate(0, 0.1, 0);
 
     const vehicleMaterial = new THREE.MeshStandardMaterial({
@@ -314,6 +316,98 @@ export class Renderer {
       x: gridX * GRID_SIZE - this.halfWorldSize + GRID_SIZE / 2,
       z: gridZ * GRID_SIZE - this.halfWorldSize + GRID_SIZE / 2,
     };
+  }
+
+  /**
+   * Phase 7: Converts a raw array of `{ x, z }` grid coordinates from `PATH_RESULT`
+   * into a Left-Hand Traffic (LHT) offset `THREE.CatmullRomCurve3`.
+   *
+   * In Three.js XZ ground coordinates (Y = up):
+   * - Forward unit vector `F = (dx, 0, dz)`
+   * - Left-hand perpendicular unit vector `L = Up × F = (0, 1, 0) × (dx, 0, dz) = (dz, 0, -dx)`
+   *
+   * Calculated strictly ONCE when a path is received from the Worker.
+   *
+   * @param {Array<{ x: number, z: number }>} rawGridPath
+   * @returns {{ curve: THREE.CatmullRomCurve3, totalLength: number } | null}
+   * @private
+   */
+  _buildLeftHandTrafficCurve(rawGridPath) {
+    if (!rawGridPath || rawGridPath.length < 2) {
+      return null;
+    }
+
+    const numNodes = rawGridPath.length;
+    const offsetPoints = [];
+    const laneOffset = this.laneOffset;
+    const roadSurfaceY = 0.05;
+
+    for (let i = 0; i < numNodes; i++) {
+      const curr = this._gridToWorld(rawGridPath[i].x, rawGridPath[i].z);
+
+      // Compute incoming and outgoing movement directions in XZ plane
+      let inDx = 0;
+      let inDz = 0;
+      if (i > 0) {
+        const prev = this._gridToWorld(rawGridPath[i - 1].x, rawGridPath[i - 1].z);
+        const len = Math.hypot(curr.x - prev.x, curr.z - prev.z) || 1;
+        inDx = (curr.x - prev.x) / len;
+        inDz = (curr.z - prev.z) / len;
+      }
+
+      let outDx = inDx;
+      let outDz = inDz;
+      if (i < numNodes - 1) {
+        const next = this._gridToWorld(rawGridPath[i + 1].x, rawGridPath[i + 1].z);
+        const len = Math.hypot(next.x - curr.x, next.z - curr.z) || 1;
+        outDx = (next.x - curr.x) / len;
+        outDz = (next.z - curr.z) / len;
+      }
+
+      if (i === 0) {
+        inDx = outDx;
+        inDz = outDz;
+      }
+
+      // Left-hand perpendicular vector for incoming and outgoing segments: L = (dz, -dx)
+      const leftInX = inDz;
+      const leftInZ = -inDx;
+      const leftOutX = outDz;
+      const leftOutZ = -outDx;
+
+      // Average the left normals at corners so the waypoint sits smoothly on the inside/outside LHT lane corner
+      let avgLeftX = (leftInX + leftOutX) * 0.5;
+      let avgLeftZ = (leftInZ + leftOutZ) * 0.5;
+      const avgLen = Math.hypot(avgLeftX, avgLeftZ);
+
+      if (avgLen > 0.0001) {
+        avgLeftX /= avgLen;
+        avgLeftZ /= avgLen;
+      } else {
+        // 180-degree U-turn fallback
+        avgLeftX = leftOutX;
+        avgLeftZ = leftOutZ;
+      }
+
+      offsetPoints.push(
+        new THREE.Vector3(
+          curr.x + avgLeftX * laneOffset,
+          roadSurfaceY,
+          curr.z + avgLeftZ * laneOffset
+        )
+      );
+    }
+
+    // Create a smooth centripetal CatmullRomCurve3 once per path
+    const curve = new THREE.CatmullRomCurve3(
+      offsetPoints,
+      false,
+      'centripetal',
+      0.25
+    );
+    const totalLength = Math.max(0.01, curve.getLength());
+
+    return { curve, totalLength };
   }
 
   /**
@@ -432,22 +526,28 @@ export class Renderer {
       const colorHex =
         this._vehiclePalette[id % this._vehiclePalette.length];
 
+      const maxSpeed = 2.0 + Math.random() * 1.0;
+
       const vehicle = {
         id,
         color: new THREE.Color(colorHex),
         currentGrid: { x: spawnRoad.x, z: spawnRoad.z },
         position: new THREE.Vector3(worldPos.x, 0.05, worldPos.z),
-        nextNodePosition: new THREE.Vector3(worldPos.x, 0.05, worldPos.z + 1),
+        tangent: new THREE.Vector3(0, 0, 1),
         quaternion: new THREE.Quaternion(),
         path: [],
-        pathIndex: 0,
-        speed: 2.2 + Math.random() * 1.2,
+        curve: null,
+        curveLength: 1,
+        t: 0,
+        maxSpeed, // Normal cruising speed (world units / sec)
+        currentSpeed: maxSpeed, // Dynamically set to 0 when braking for V2V collision avoidance
         waitingForPath: false,
       };
 
       this.dummyTransform.position.copy(vehicle.position);
       this.dummyTransform.scale.set(1, 1, 1);
-      this.dummyTransform.lookAt(vehicle.nextNodePosition);
+      this._lookAtTarget.copy(vehicle.position).add(vehicle.tangent);
+      this.dummyTransform.lookAt(this._lookAtTarget);
       vehicle.quaternion.copy(this.dummyTransform.quaternion);
       this.dummyTransform.updateMatrix();
 
@@ -461,17 +561,18 @@ export class Renderer {
       this._requestNewPathForVehicle(vehicle, endpoints);
     }
 
+    // Re-dispatch idle vehicles that finished or lost their curve
     for (let i = 0; i < this.activeVehicles.length; i++) {
       const v = this.activeVehicles[i];
-      if (!v.waitingForPath && v.path.length === 0) {
+      if (!v.waitingForPath && !v.curve) {
         this._requestNewPathForVehicle(v, endpoints);
       }
     }
   }
 
   /**
-   * Receives `PATH_RESULT` messages from `PathfindingWorker.js` and assigns the waypoint
-   * path to the corresponding vehicle agent.
+   * Receives `PATH_RESULT` messages from `PathfindingWorker.js`, builds the LHT offset
+   * `THREE.CatmullRomCurve3` ONCE, and initializes `vehicle.t = 0`.
    * @param {MessageEvent} event
    */
   onWorkerMessage(event) {
@@ -483,9 +584,11 @@ export class Renderer {
 
     vehicle.waitingForPath = false;
 
-    if (!data.path || data.path.length < 2) {
+    const curveData = this._buildLeftHandTrafficCurve(data.path);
+    if (!curveData) {
       vehicle.path = [];
-      vehicle.pathIndex = 0;
+      vehicle.curve = null;
+      vehicle.t = 0;
       const { allRoads } = this._getNavigableRoadEndpoints();
       if (allRoads.length > 0) {
         const randomRoad =
@@ -508,22 +611,25 @@ export class Renderer {
     }
 
     vehicle.path = data.path;
-    vehicle.pathIndex = 1;
+    vehicle.curve = curveData.curve;
+    vehicle.curveLength = curveData.totalLength;
+    vehicle.t = 0;
+    vehicle.currentSpeed = vehicle.maxSpeed;
 
     const startNode = data.path[0];
-    const startWorld = this._gridToWorld(startNode.x, startNode.z);
     vehicle.currentGrid = { x: startNode.x, z: startNode.z };
-    vehicle.position.set(startWorld.x, 0.05, startWorld.z);
 
-    const nextNode = data.path[1];
-    const nextWorld = this._gridToWorld(nextNode.x, nextNode.z);
-    vehicle.nextNodePosition.set(nextWorld.x, 0.05, nextWorld.z);
+    // Evaluate initial position and tangent at t = 0 along the LHT CatmullRomCurve3
+    vehicle.curve.getPointAt(0, vehicle.position);
+    vehicle.curve.getTangentAt(0, vehicle.tangent);
 
     this.dummyTransform.position.copy(vehicle.position);
     this.dummyTransform.scale.set(1, 1, 1);
-    this.dummyTransform.lookAt(vehicle.nextNodePosition);
+    this._lookAtTarget.copy(vehicle.position).add(vehicle.tangent);
+    this.dummyTransform.lookAt(this._lookAtTarget);
     vehicle.quaternion.copy(this.dummyTransform.quaternion);
     this.dummyTransform.updateMatrix();
+
     this.vehicleManager.updateInstance(
       vehicle.id,
       this.dummyTransform.matrix,
@@ -532,7 +638,59 @@ export class Renderer {
   }
 
   /**
-   * Updates all active vehicles every frame (`requestAnimationFrame`).
+   * Phase 7 V2V Collision Avoidance Check:
+   * Checks if any other active vehicle is within `< 0.8` units (`this.safeFollowingDistance`)
+   * AND located directly in front of `vehicle` along its forward tangent cone (and moving in
+   * roughly the same lane/direction so opposing LHT lanes never block each other).
+   *
+   * @param {object} vehicle
+   * @param {number} selfIndex
+   * @returns {boolean} True if blocked by a vehicle ahead (must brake to speed = 0)
+   * @private
+   */
+  _isBlockedByVehicleAhead(vehicle, selfIndex) {
+    const minDistSq = this.safeFollowingDistance * this.safeFollowingDistance;
+
+    for (let j = 0; j < this.activeVehicles.length; j++) {
+      if (j === selfIndex) continue;
+
+      const other = this.activeVehicles[j];
+      if (!other.curve) continue;
+
+      this._toOtherVehicle.subVectors(other.position, vehicle.position);
+      const distSq = this._toOtherVehicle.lengthSq();
+
+      if (distSq > 0.00001 && distSq < minDistSq) {
+        const dist = Math.sqrt(distSq);
+        // Dot product between our forward unit tangent and unit vector toward the other vehicle
+        const forwardAlignment =
+          (this._toOtherVehicle.x * vehicle.tangent.x +
+            this._toOtherVehicle.z * vehicle.tangent.z) /
+          dist;
+
+        // Check that the other vehicle is directly in front of us (narrow forward cone > cos(32°))
+        if (forwardAlignment > 0.84) {
+          // Also ensure the other vehicle is not in the oncoming LHT lane heading opposite to us
+          const headingAlignment =
+            vehicle.tangent.x * other.tangent.x +
+            vehicle.tangent.z * other.tangent.z;
+
+          if (headingAlignment > -0.25) {
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Phase 7 Animation Loop for Vehicles (`requestAnimationFrame`):
+   * - Evaluates V2V proximity to brake (`currentSpeed = 0`) or resume (`currentSpeed = maxSpeed`)
+   * - Advances parameter `t` (0.0 to 1.0) along the precomputed `THREE.CatmullRomCurve3`
+   * - Uses `curve.getPointAt(t)` for position and `curve.getTangentAt(t)` for `lookAt` rotation
+   * - Dispatches a new `FIND_PATH` request when `t >= 1.0`
    * @param {number} dt - Frame delta time in seconds
    * @private
    */
@@ -541,53 +699,58 @@ export class Renderer {
 
     for (let i = 0; i < this.activeVehicles.length; i++) {
       const vehicle = this.activeVehicles[i];
-      if (vehicle.path.length === 0 || vehicle.pathIndex >= vehicle.path.length) {
+      if (!vehicle.curve) {
         continue;
       }
 
-      const nextNodePosition = vehicle.nextNodePosition;
+      // 1. V2V Collision Avoidance: brake if another vehicle is < 0.8 units ahead
+      const isBlocked = this._isBlockedByVehicleAhead(vehicle, i);
+      vehicle.currentSpeed = isBlocked ? 0 : vehicle.maxSpeed;
 
-      this._moveDirection.subVectors(nextNodePosition, vehicle.position);
-      const distance = this._moveDirection.length();
-
-      if (distance > 0.0001) {
-        this.dummyTransform.position.copy(vehicle.position);
-        this.dummyTransform.scale.set(1, 1, 1);
-        this.dummyTransform.lookAt(nextNodePosition);
-        vehicle.quaternion.copy(this.dummyTransform.quaternion);
+      // 2. Advance parameter `t` along the CatmullRomCurve3 if not braking
+      if (vehicle.currentSpeed > 0) {
+        const deltaT = (vehicle.currentSpeed * dt) / vehicle.curveLength;
+        vehicle.t += deltaT;
       }
 
-      const step = vehicle.speed * dt;
+      // 3. Check if vehicle has reached the end of the curve (t >= 1.0)
+      if (vehicle.t >= 1.0) {
+        vehicle.curve.getPointAt(1.0, vehicle.position);
+        vehicle.curve.getTangentAt(1.0, vehicle.tangent);
 
-      if (step >= distance) {
-        vehicle.position.copy(nextNodePosition);
-        const reachedNode = vehicle.path[vehicle.pathIndex];
-        vehicle.currentGrid = { x: reachedNode.x, z: reachedNode.z };
-
-        vehicle.pathIndex++;
-
-        if (vehicle.pathIndex < vehicle.path.length) {
-          const nextNode = vehicle.path[vehicle.pathIndex];
-          const nextWorld = this._gridToWorld(nextNode.x, nextNode.z);
-          nextNodePosition.set(nextWorld.x, 0.05, nextWorld.z);
-
-          this.dummyTransform.position.copy(vehicle.position);
-          this.dummyTransform.scale.set(1, 1, 1);
-          this.dummyTransform.lookAt(nextNodePosition);
-          vehicle.quaternion.copy(this.dummyTransform.quaternion);
-        } else {
-          vehicle.path = [];
-          vehicle.pathIndex = 0;
-          this._requestNewPathForVehicle(vehicle);
+        const lastNode = vehicle.path[vehicle.path.length - 1];
+        if (lastNode) {
+          vehicle.currentGrid = { x: lastNode.x, z: lastNode.z };
         }
+
+        vehicle.curve = null;
+        vehicle.path = [];
+        vehicle.t = 0;
+
+        this._requestNewPathForVehicle(vehicle);
       } else {
-        const alpha = step / distance;
-        vehicle.position.lerp(nextNodePosition, alpha);
+        // 4. Evaluate smooth position and forward tangent along the curve at `t`
+        vehicle.curve.getPointAt(vehicle.t, vehicle.position);
+        vehicle.curve.getTangentAt(vehicle.t, vehicle.tangent);
+
+        // Keep `currentGrid` updated to the nearest path node for accurate re-routing if needed
+        const approxIdx = Math.min(
+          vehicle.path.length - 1,
+          Math.floor(vehicle.t * (vehicle.path.length - 1))
+        );
+        const currentNode = vehicle.path[approxIdx];
+        if (currentNode) {
+          vehicle.currentGrid.x = currentNode.x;
+          vehicle.currentGrid.z = currentNode.z;
+        }
       }
 
+      // 5. Orient vehicle using `curve.getTangentAt(t)` + `lookAt` and update InstancedMesh
       this.dummyTransform.position.copy(vehicle.position);
-      this.dummyTransform.quaternion.copy(vehicle.quaternion);
       this.dummyTransform.scale.set(1, 1, 1);
+      this._lookAtTarget.copy(vehicle.position).add(vehicle.tangent);
+      this.dummyTransform.lookAt(this._lookAtTarget);
+      vehicle.quaternion.copy(this.dummyTransform.quaternion);
       this.dummyTransform.updateMatrix();
 
       this.vehicleManager.updateInstance(
