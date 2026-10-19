@@ -45,6 +45,7 @@ export class Renderer {
     this.onMouseMove = this.onMouseMove.bind(this);
     this.onMouseDown = this.onMouseDown.bind(this);
     this.onMouseUp = this.onMouseUp.bind(this);
+    this.onKeyUp = this.onKeyUp.bind(this);
     this.animate = this.animate.bind(this);
 
     // Initialize subsystems
@@ -66,6 +67,7 @@ export class Renderer {
     this.canvas.addEventListener('mousemove', this.onMouseMove);
     this.canvas.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mouseup', this.onMouseUp);
+    window.addEventListener('keyup', this.onKeyUp);
 
     // Start render loop
     this.animate();
@@ -129,9 +131,8 @@ export class Renderer {
   }
 
   /**
-   * Configures MapControls:
-   * - Left mouse button is freed for Drag-to-Zone selection on the grid.
-   * - Right mouse drag orbits/rotates the camera; Middle mouse drag (or Shift+Right) pans.
+   * Configures MapControls with standard camera panning (left drag) and rotation (right drag).
+   * When Shift + Left-Click is used for zoning, `this.controls.enabled` is locked to `false`.
    * @private
    */
   _initControls() {
@@ -142,11 +143,6 @@ export class Renderer {
     this.controls.minDistance = 5;
     this.controls.maxDistance = 200;
     this.controls.maxPolarAngle = Math.PI / 2 - 0.05;
-    this.controls.mouseButtons = {
-      LEFT: null,
-      MIDDLE: THREE.MOUSE.PAN,
-      RIGHT: THREE.MOUSE.ROTATE,
-    };
     this.controls.target.set(0, 0, 0);
     this.controls.update();
   }
@@ -190,15 +186,15 @@ export class Renderer {
     cursorGeometry.translate(0, (GRID_SIZE * 0.2) / 2, 0);
 
     this.cursorMaterial = new THREE.MeshBasicMaterial({
-      color: 0x38bdf8,
+      color: 0x22c55e,
       transparent: true,
       opacity: 0.45,
       depthWrite: false,
     });
 
-    this.cursorMesh = new THREE.Mesh(cursorGeometry, this.cursorMaterial);
-    this.cursorMesh.visible = false;
-    this.scene.add(this.cursorMesh);
+    this.cursorIndicator = new THREE.Mesh(cursorGeometry, this.cursorMaterial);
+    this.cursorIndicator.visible = false;
+    this.scene.add(this.cursorIndicator);
   }
 
   /**
@@ -299,11 +295,12 @@ export class Renderer {
   }
 
   /**
-   * Starts a Drag-to-Zone operation on left mouse button down.
+   * Starts a Drag-to-Zone operation ONLY when holding Shift + Left Click.
+   * Otherwise allows MapControls to pan/rotate the camera normally.
    * @param {MouseEvent} event
    */
   onMouseDown(event) {
-    if (event.button !== 0) {
+    if (event.button !== 0 || !event.shiftKey) {
       return;
     }
 
@@ -311,6 +308,9 @@ export class Renderer {
     if (!snapped) {
       return;
     }
+
+    // Lock camera controls while drawing the zone
+    this.controls.enabled = false;
 
     this.isDragging = true;
     this.dragStartGrid.x = snapped.gridX;
@@ -323,26 +323,32 @@ export class Renderer {
   }
 
   /**
-   * Updates the single cursor indicator and, when dragging, updates the dragOverlayMesh
-   * bounding box position and scale.
+   * Updates the cursorIndicator (only visible when Shift is held or while dragging)
+   * and updates the dragOverlayMesh bounding box while dragging.
    * @param {MouseEvent} event
    */
   onMouseMove(event) {
+    // Only show cursorIndicator if holding Shift or actively dragging a zone
+    if (!event.shiftKey && !this.isDragging) {
+      this.cursorIndicator.visible = false;
+      return;
+    }
+
     const snapped = this._getSnappedGridFromEvent(event);
 
     if (!snapped) {
-      this.cursorMesh.visible = false;
+      this.cursorIndicator.visible = false;
       this.hoveredGridCoords = null;
       return;
     }
 
-    // 1. Keep single cursorIndicator logic active
+    // 1. Update single cursorIndicator position and visibility
     this.hoveredGridCoords = snapped;
-    this.cursorMesh.position.set(snapped.worldX, 0.01, snapped.worldZ);
-    this.cursorMesh.visible = true;
+    this.cursorIndicator.position.set(snapped.worldX, 0.01, snapped.worldZ);
+    this.cursorIndicator.visible = true;
 
     const canBuild = this.gameState.canBuild(snapped.gridX, snapped.gridZ);
-    this.cursorMaterial.color.setHex(canBuild ? 0x38bdf8 : 0xf87171);
+    this.cursorMaterial.color.setHex(canBuild ? 0x22c55e : 0xf87171);
 
     // 2. If dragging, dynamically stretch and center dragOverlayMesh
     if (this.isDragging) {
@@ -353,12 +359,12 @@ export class Renderer {
   }
 
   /**
-   * Finalizes the Drag-to-Zone selection on mouse up, iterating through the bounding box
-   * and populating buildings in GameState and InstanceManager.
+   * Finalizes the Drag-to-Zone selection on mouse up, populates buildings in
+   * GameState and InstanceManager, and unlocks MapControls.
    * @param {MouseEvent} event
    */
   onMouseUp(event) {
-    if (event.button !== 0 || !this.isDragging) {
+    if (!this.isDragging) {
       return;
     }
 
@@ -417,17 +423,31 @@ export class Renderer {
       }
     }
 
-    // Reset drag state and hide overlay
+    // Reset drag state, hide overlay, and re-enable MapControls
     this.isDragging = false;
     this.dragOverlayMesh.visible = false;
+    this.controls.enabled = true;
 
-    // Refresh cursor indicator color if still hovering over a valid tile
-    if (this.hoveredGridCoords) {
+    // Hide cursor indicator if Shift was released before mouseup
+    if (!event.shiftKey) {
+      this.cursorIndicator.visible = false;
+    } else if (this.hoveredGridCoords) {
       const canBuildNow = this.gameState.canBuild(
         this.hoveredGridCoords.gridX,
         this.hoveredGridCoords.gridZ
       );
-      this.cursorMaterial.color.setHex(canBuildNow ? 0x38bdf8 : 0xf87171);
+      this.cursorMaterial.color.setHex(canBuildNow ? 0x22c55e : 0xf87171);
+    }
+  }
+
+  /**
+   * Hides the cursorIndicator immediately when the user releases the Shift key
+   * (unless actively dragging a zone).
+   * @param {KeyboardEvent} event
+   */
+  onKeyUp(event) {
+    if (event.key === 'Shift' && !this.isDragging) {
+      this.cursorIndicator.visible = false;
     }
   }
 
