@@ -4,7 +4,7 @@
  * MapControls, Raycaster, Grid Snapping Cursor, Drag-to-Zone Overlay,
  * Phase 3 Procedural Evolution (RCI), Phase 4 Road Networks & Auto-Tiling (Bitmasking),
  * Phase 5 Web Worker A* Pathfinding, Phase 6 UI Integration, and
- * Phase 7 Left-Hand Traffic Lane Offsets, CatmullRomCurve3 Cornering & Dot-Product V2V Collision Avoidance.
+ * Phase 7 High-Res Offset CatmullRomCurve3 & Curve-Parameter (t) V2V Braking.
  */
 
 import * as THREE from 'three';
@@ -33,17 +33,15 @@ export class Renderer {
     this.dragEndGrid = { x: 0, z: 0 };
     this.currentTool = 'residential'; // 'residential' | 'road' | 'bulldozer'
 
-    // Reusable objects for matrix composition, curve evaluation, and V2V collision checks
+    // Reusable objects for matrix composition and raycasting
     this.raycaster = new THREE.Raycaster();
     this.mouse = new THREE.Vector2();
     this.dummyTransform = new THREE.Object3D();
     this._buildingColor = new THREE.Color();
     this._roadColor = new THREE.Color();
     this._lookAtTarget = new THREE.Vector3();
-    this._v1ForwardVector = new THREE.Vector3();
-    this._dirToV2 = new THREE.Vector3();
 
-    // Phase 5 & Phase 7: Vehicle Agent tracking, LHT lane offset, and V2V constants
+    // Phase 5 & Phase 7: Vehicle Agent tracking
     this.activeVehicles = [];
     this.maxVehicles = 100;
     this._nextVehicleId = 1;
@@ -318,13 +316,12 @@ export class Renderer {
   }
 
   /**
-   * Phase 7: Converts a raw array of `{ x, z }` grid coordinates from `PATH_RESULT`
-   * into a Left-Hand Traffic (LHT) offset `THREE.CatmullRomCurve3` using the exact
-   * perpendicular vector math:
-   * - For point A (current) and B (next):
-   * - `dx = B.x - A.x; dz = B.z - A.z;` (normalized)
-   * - Left Perpendicular vector: `px = -dz; pz = dx;`
-   * - Offset applied: `A.x += px * 0.25; A.z += pz * 0.25;`
+   * Phase 7 Continuous Curve Offsetting:
+   * 1. Constructs the center `THREE.CatmullRomCurve3` FIRST from the raw grid path points.
+   * 2. Extracts 50 high-resolution points from the center curve via `centerCurve.getPoints(50)`.
+   * 3. Iterates through those 50 points, computes the normalized left-perpendicular tangent
+   *    (`px = -dz`, `pz = dx`), applies the `0.25` offset, and constructs a NEW
+   *    `THREE.CatmullRomCurve3` from the offset points so corners remain smoothly parallel without compression.
    *
    * @param {Array<{ x: number, z: number }>} rawGridPath
    * @returns {{ curve: THREE.CatmullRomCurve3, totalLength: number } | null}
@@ -335,47 +332,49 @@ export class Renderer {
       return null;
     }
 
-    // 1. Convert grid coordinates to fresh THREE.Vector3 world positions (avoiding shared references)
-    const worldPoints = [];
+    // 1. Create the center CatmullRomCurve3 first from raw grid points
+    const centerWorldPoints = [];
     for (let i = 0; i < rawGridPath.length; i++) {
       const w = this._gridToWorld(rawGridPath[i].x, rawGridPath[i].z);
-      worldPoints.push(new THREE.Vector3(w.x, 0.05, w.z));
+      centerWorldPoints.push(new THREE.Vector3(w.x, 0.05, w.z));
     }
 
-    // 2. Calculate the left-perpendicular offset for every point BEFORE creating CatmullRomCurve3
+    const centerCurve = new THREE.CatmullRomCurve3(centerWorldPoints);
+
+    // 2. Sample 50 high-resolution points along the center curve
+    const sampledPoints = centerCurve.getPoints(50);
+
+    // 3. Compute the left-perpendicular tangent (-dz, dx) at each high-res point and apply 0.25 offset
     const offsetPoints = [];
     let lastPx = 0;
     let lastPz = 0;
 
-    for (let i = 0; i < worldPoints.length; i++) {
-      const A = worldPoints[i].clone();
+    for (let i = 0; i < sampledPoints.length; i++) {
+      const A = sampledPoints[i].clone();
 
-      if (i < worldPoints.length - 1) {
-        const B = worldPoints[i + 1];
+      if (i < sampledPoints.length - 1) {
+        const B = sampledPoints[i + 1];
 
-        // Calculate direction vector from A to B
         let dx = B.x - A.x;
         let dz = B.z - A.z;
-
-        // Normalize the direction vector
         const length = Math.hypot(dx, dz);
+
         if (length > 0.00001) {
           dx /= length;
           dz /= length;
         }
 
-        // Calculate the Left Perpendicular vector (assuming Y is UP): px = -dz, pz = dx
+        // Left-perpendicular tangent vector: (-dz, dx)
         const px = -dz;
         const pz = dx;
 
         lastPx = px;
         lastPz = pz;
 
-        // Apply the offset (0.25 units)
         A.x += px * 0.25;
         A.z += pz * 0.25;
       } else {
-        // Apply the final segment's perpendicular offset to the last point in the path
+        // Apply final tangent perpendicular offset to the last sampled point
         A.x += lastPx * 0.25;
         A.z += lastPz * 0.25;
       }
@@ -383,11 +382,11 @@ export class Renderer {
       offsetPoints.push(A);
     }
 
-    // 3. Build the CatmullRomCurve3 once from the offset points
-    const curve = new THREE.CatmullRomCurve3(offsetPoints);
-    const totalLength = Math.max(0.01, curve.getLength());
+    // 4. Construct a NEW CatmullRomCurve3 from the high-res offset points
+    const offsetCurve = new THREE.CatmullRomCurve3(offsetPoints);
+    const totalLength = Math.max(0.01, offsetCurve.getLength());
 
-    return { curve, totalLength };
+    return { curve: offsetCurve, totalLength };
   }
 
   /**
@@ -478,8 +477,6 @@ export class Renderer {
   /**
    * Spawns vehicle agents proportional to the city's road/building network
    * and dispatches initial path requests to `this.pathWorker`.
-   * Each vehicle owns a dedicated `dummy` (`THREE.Object3D`) so `v1.dummy.position`
-   * and `v1.dummy.getWorldDirection()` are always accurate and never share references.
    * @private
    */
   _manageVehiclePopulation() {
@@ -514,7 +511,6 @@ export class Renderer {
       dummy.scale.set(1, 1, 1);
       dummy.lookAt(worldPos.x, 0.05, worldPos.z + 1);
       dummy.updateMatrix();
-      dummy.updateMatrixWorld(true);
 
       const vehicle = {
         id,
@@ -523,6 +519,7 @@ export class Renderer {
         currentGrid: { x: spawnRoad.x, z: spawnRoad.z },
         tangent: new THREE.Vector3(0, 0, 1),
         path: [],
+        targetNodeString: '',
         curve: null,
         curveLength: 1,
         t: 0,
@@ -551,8 +548,8 @@ export class Renderer {
   }
 
   /**
-   * Receives `PATH_RESULT` messages from `PathfindingWorker.js`, builds the LHT offset
-   * `THREE.CatmullRomCurve3` ONCE, and initializes `vehicle.t = 0`.
+   * Receives `PATH_RESULT` messages from `PathfindingWorker.js`, builds the high-res LHT offset
+   * `THREE.CatmullRomCurve3` ONCE, stores `vehicle.targetNodeString`, and initializes `vehicle.t = 0`.
    * @param {MessageEvent} event
    */
   onWorkerMessage(event) {
@@ -567,6 +564,7 @@ export class Renderer {
     const curveData = this._buildLeftHandTrafficCurve(data.path);
     if (!curveData) {
       vehicle.path = [];
+      vehicle.targetNodeString = '';
       vehicle.curve = null;
       vehicle.t = 0;
       const { allRoads } = this._getNavigableRoadEndpoints();
@@ -577,7 +575,6 @@ export class Renderer {
         const worldPos = this._gridToWorld(randomRoad.x, randomRoad.z);
         vehicle.dummy.position.set(worldPos.x, 0.05, worldPos.z);
         vehicle.dummy.updateMatrix();
-        vehicle.dummy.updateMatrixWorld(true);
         this.vehicleManager.updateInstance(
           vehicle.id,
           vehicle.dummy.matrix,
@@ -588,6 +585,8 @@ export class Renderer {
     }
 
     vehicle.path = data.path;
+    const lastNode = vehicle.path[vehicle.path.length - 1];
+    vehicle.targetNodeString = lastNode.x + ',' + lastNode.z;
     vehicle.curve = curveData.curve;
     vehicle.curveLength = curveData.totalLength;
     vehicle.t = 0;
@@ -596,14 +595,13 @@ export class Renderer {
     const startNode = data.path[0];
     vehicle.currentGrid = { x: startNode.x, z: startNode.z };
 
-    // Evaluate initial position and tangent at t = 0 along the LHT CatmullRomCurve3
+    // Evaluate initial position and tangent at t = 0 along the high-res offset CatmullRomCurve3
     vehicle.curve.getPointAt(0, vehicle.dummy.position);
     vehicle.curve.getTangentAt(0, vehicle.tangent);
 
     this._lookAtTarget.copy(vehicle.dummy.position).add(vehicle.tangent);
     vehicle.dummy.lookAt(this._lookAtTarget);
     vehicle.dummy.updateMatrix();
-    vehicle.dummy.updateMatrixWorld(true);
 
     this.vehicleManager.updateInstance(
       vehicle.id,
@@ -614,8 +612,9 @@ export class Renderer {
 
   /**
    * Phase 7 Animation Loop for Vehicles (`requestAnimationFrame`):
-   * 1. Runs strict distance (`dist < 0.8`) and dot-product (`dot > 0.5`) collision avoidance
-   *    using `v1.dummy.getWorldDirection(v1ForwardVector)` and `v2.dummy.position.clone().sub(v1.dummy.position).normalize()`.
+   * 1. Curve-Based Braking: Compares `v1` and `v2` sharing the exact same `targetNodeString`.
+   *    If `v2.t > v1.t` AND `(v2.t - v1.t) < (0.8 / v1.curveLength)`, sets `v1.currentSpeed = 0` (Brake).
+   *    Else sets `v1.currentSpeed = v1.maxSpeed`.
    * 2. Advances `v1.t` along `v1.curve` (`CatmullRomCurve3`) using `v1.currentSpeed`.
    * 3. Updates `v1.dummy.position` via `curve.getPointAt(t)` and orientation via `curve.getTangentAt(t)` + `lookAt`.
    * @param {number} dt - Frame delta time in seconds
@@ -624,32 +623,25 @@ export class Renderer {
   _updateVehicles(dt) {
     if (this.activeVehicles.length === 0) return;
 
-    // Step 1: Dot Product Collision Avoidance (Braking)
+    // Step 1: Curve-Based Braking (T-parameter collision detection)
     for (let i = 0; i < this.activeVehicles.length; i++) {
       const v1 = this.activeVehicles[i];
-      if (!v1.curve) continue;
+      if (!v1.curve || !v1.targetNodeString) continue;
 
       let shouldBrake = false;
-      v1.dummy.getWorldDirection(this._v1ForwardVector);
+      const safeThresholdT = 0.8 / v1.curveLength;
 
       for (let j = 0; j < this.activeVehicles.length; j++) {
         if (i === j) continue;
 
         const v2 = this.activeVehicles[j];
-        if (!v2.curve) continue;
+        if (!v2.curve || v1.targetNodeString !== v2.targetNodeString) {
+          continue;
+        }
 
-        const dist = v1.dummy.position.distanceTo(v2.dummy.position);
-        if (dist < 0.8 && dist > 0.0001) {
-          const dirToV2 = v2.dummy.position
-            .clone()
-            .sub(v1.dummy.position)
-            .normalize();
-          const dot = this._v1ForwardVector.dot(dirToV2);
-
-          if (dot > 0.5) {
-            shouldBrake = true;
-            break;
-          }
+        if (v2.t > v1.t && v2.t - v1.t < safeThresholdT) {
+          shouldBrake = true;
+          break;
         }
       }
 
@@ -660,7 +652,7 @@ export class Renderer {
       }
     }
 
-    // Step 2: Advance vehicles along their LHT CatmullRomCurve3 and update InstancedMesh
+    // Step 2: Advance vehicles along their high-res offset CatmullRomCurve3 and update InstancedMesh
     for (let i = 0; i < this.activeVehicles.length; i++) {
       const v1 = this.activeVehicles[i];
       if (!v1.curve) continue;
@@ -681,6 +673,7 @@ export class Renderer {
 
         v1.curve = null;
         v1.path = [];
+        v1.targetNodeString = '';
         v1.t = 0;
 
         this._requestNewPathForVehicle(v1);
@@ -702,7 +695,6 @@ export class Renderer {
       this._lookAtTarget.copy(v1.dummy.position).add(v1.tangent);
       v1.dummy.lookAt(this._lookAtTarget);
       v1.dummy.updateMatrix();
-      v1.dummy.updateMatrixWorld(true);
 
       this.vehicleManager.updateInstance(
         v1.id,
