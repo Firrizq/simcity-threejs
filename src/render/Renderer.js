@@ -26,11 +26,11 @@ export class Renderer {
     this.worldSize = GRID_DIMENSIONS * GRID_SIZE;
     this.halfWorldSize = this.worldSize / 2;
 
-    // Tool & Drag state management (Phase 2 & Phase 4)
+    // Tool & Drag state management (Phase 2, Phase 4, Phase 6)
     this.isDragging = false;
     this.dragStartGrid = { x: 0, z: 0 };
     this.dragEndGrid = { x: 0, z: 0 };
-    this.currentTool = 'residential'; // 'residential' (Z) | 'road' (R) | 'bulldozer' (X)
+    this.currentTool = 'residential'; // 'residential' | 'road' | 'bulldozer'
 
     // Reusable objects for matrix composition and raycasting
     this.raycaster = new THREE.Raycaster();
@@ -63,7 +63,6 @@ export class Renderer {
     this.onMouseMove = this.onMouseMove.bind(this);
     this.onMouseDown = this.onMouseDown.bind(this);
     this.onMouseUp = this.onMouseUp.bind(this);
-    this.onKeyDown = this.onKeyDown.bind(this);
     this.onKeyUp = this.onKeyUp.bind(this);
     this.onGameTick = this.onGameTick.bind(this);
     this.onWorkerMessage = this.onWorkerMessage.bind(this);
@@ -84,12 +83,11 @@ export class Renderer {
     this._initInstanceManagers();
     this._initPathfindingWorker();
 
-    // Register DOM event listeners
+    // Register DOM event listeners (temporary R/Z/X keydown listener removed in Phase 6)
     window.addEventListener('resize', this.onWindowResize);
     this.canvas.addEventListener('mousemove', this.onMouseMove);
     this.canvas.addEventListener('mousedown', this.onMouseDown);
     window.addEventListener('mouseup', this.onMouseUp);
-    window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
 
     // Start Phase 3 Simulation Tick Loop (1 tick per second)
@@ -97,6 +95,21 @@ export class Renderer {
 
     // Start WebGL render loop
     this.animate();
+  }
+
+  /**
+   * Sets the active tool ('residential' | 'road' | 'bulldozer') from UIManager callbacks.
+   * @param {string} toolName
+   */
+  setTool(toolName) {
+    this.currentTool = toolName;
+    if (this.hoveredGridCoords) {
+      const canBuild = this.gameState.canBuild(
+        this.hoveredGridCoords.gridX,
+        this.hoveredGridCoords.gridZ
+      );
+      this._updateToolFeedbackColors(canBuild);
+    }
   }
 
   /**
@@ -255,7 +268,6 @@ export class Renderer {
       new URL('../workers/PathfindingWorker.js', import.meta.url),
       { type: 'module' }
     );
-    // Alias for backward compatibility
     this.pathfindingWorker = this.pathWorker;
 
     this.pathWorker.onmessage = this.onWorkerMessage;
@@ -323,7 +335,6 @@ export class Renderer {
       if (cell.type === 'road') {
         allRoads.push({ x: cell.x, z: cell.z });
       } else {
-        // Check if this building has an adjacent road tile for vehicle pickup/dropoff
         const neighbors = [
           { x: cell.x, z: cell.z - 1 },
           { x: cell.x + 1, z: cell.z },
@@ -366,14 +377,12 @@ export class Renderer {
       ? { x: vehicle.currentGrid.x, z: vehicle.currentGrid.z }
       : candidatePool[Math.floor(Math.random() * candidatePool.length)];
 
-    // Verify startCoord is still a valid road (in case it was bulldozed)
     const startCell = this.gameState.getCell(startCoord.x, startCoord.z);
     const validStart =
       startCell && startCell.type === 'road'
         ? startCoord
         : allRoads[Math.floor(Math.random() * allRoads.length)];
 
-    // Pick a random destination distinct from validStart
     let targetCoord =
       candidatePool[Math.floor(Math.random() * candidatePool.length)];
     for (let attempt = 0; attempt < 6; attempt++) {
@@ -401,7 +410,6 @@ export class Renderer {
     const endpoints = this._getNavigableRoadEndpoints();
     const { allRoads } = endpoints;
 
-    // If roads were demolished leaving fewer than 2 road tiles, clear active vehicles
     if (allRoads.length < 2) {
       if (this.activeVehicles.length > 0) {
         for (let i = 0; i < this.activeVehicles.length; i++) {
@@ -412,7 +420,6 @@ export class Renderer {
       return;
     }
 
-    // Target 1 vehicle per 4 road tiles, up to maxVehicles
     const desiredCount = Math.min(
       this.maxVehicles,
       Math.max(1, Math.floor(allRoads.length / 4))
@@ -434,7 +441,7 @@ export class Renderer {
         quaternion: new THREE.Quaternion(),
         path: [],
         pathIndex: 0,
-        speed: 2.2 + Math.random() * 1.2, // World units per second
+        speed: 2.2 + Math.random() * 1.2,
         waitingForPath: false,
       };
 
@@ -454,7 +461,6 @@ export class Renderer {
       this._requestNewPathForVehicle(vehicle, endpoints);
     }
 
-    // Re-dispatch idle vehicles that finished or lost their path using the cached endpoints
     for (let i = 0; i < this.activeVehicles.length; i++) {
       const v = this.activeVehicles[i];
       if (!v.waitingForPath && v.path.length === 0) {
@@ -488,7 +494,6 @@ export class Renderer {
         const worldPos = this._gridToWorld(randomRoad.x, randomRoad.z);
         vehicle.position.set(worldPos.x, 0.05, worldPos.z);
 
-        // Immediately sync relocated position to the GPU buffer so the vehicle mesh doesn't lag behind
         this.dummyTransform.position.copy(vehicle.position);
         this.dummyTransform.quaternion.copy(vehicle.quaternion);
         this.dummyTransform.scale.set(1, 1, 1);
@@ -514,7 +519,6 @@ export class Renderer {
     const nextWorld = this._gridToWorld(nextNode.x, nextNode.z);
     vehicle.nextNodePosition.set(nextWorld.x, 0.05, nextWorld.z);
 
-    // Orient toward the first waypoint immediately when the path is assigned
     this.dummyTransform.position.copy(vehicle.position);
     this.dummyTransform.scale.set(1, 1, 1);
     this.dummyTransform.lookAt(vehicle.nextNodePosition);
@@ -528,11 +532,7 @@ export class Renderer {
   }
 
   /**
-   * Updates all active vehicles every frame (`requestAnimationFrame`):
-   * - Calculates movement direction toward `nextNodePosition`
-   * - Orients the vehicle's head along the path using `this.dummyTransform.lookAt(nextNodePosition)`
-   * - Linearly interpolates (lerps) 3D position toward `nextNodePosition`
-   * - Updates GPU via `this.vehicleManager.updateInstance(id, matrix, color)`
+   * Updates all active vehicles every frame (`requestAnimationFrame`).
    * @param {number} dt - Frame delta time in seconds
    * @private
    */
@@ -547,11 +547,9 @@ export class Renderer {
 
       const nextNodePosition = vehicle.nextNodePosition;
 
-      // Calculate movement direction vector and distance to next path node
       this._moveDirection.subVectors(nextNodePosition, vehicle.position);
       const distance = this._moveDirection.length();
 
-      // Orient the vehicle to face `nextNodePosition` before advancing/updating matrix
       if (distance > 0.0001) {
         this.dummyTransform.position.copy(vehicle.position);
         this.dummyTransform.scale.set(1, 1, 1);
@@ -562,7 +560,6 @@ export class Renderer {
       const step = vehicle.speed * dt;
 
       if (step >= distance) {
-        // Reached current waypoint node
         vehicle.position.copy(nextNodePosition);
         const reachedNode = vehicle.path[vehicle.pathIndex];
         vehicle.currentGrid = { x: reachedNode.x, z: reachedNode.z };
@@ -570,29 +567,24 @@ export class Renderer {
         vehicle.pathIndex++;
 
         if (vehicle.pathIndex < vehicle.path.length) {
-          // Advance nextNodePosition to the next waypoint along the curve/path
           const nextNode = vehicle.path[vehicle.pathIndex];
           const nextWorld = this._gridToWorld(nextNode.x, nextNode.z);
           nextNodePosition.set(nextWorld.x, 0.05, nextWorld.z);
 
-          // Immediately orient toward the new waypoint so corners are crisp
           this.dummyTransform.position.copy(vehicle.position);
           this.dummyTransform.scale.set(1, 1, 1);
           this.dummyTransform.lookAt(nextNodePosition);
           vehicle.quaternion.copy(this.dummyTransform.quaternion);
         } else {
-          // Reached final destination -> clear path and request a new route from Worker
           vehicle.path = [];
           vehicle.pathIndex = 0;
           this._requestNewPathForVehicle(vehicle);
         }
       } else {
-        // Smooth linear interpolation (Lerp) toward nextNodePosition
         const alpha = step / distance;
         vehicle.position.lerp(nextNodePosition, alpha);
       }
 
-      // Apply final position + lookAt orientation to dummyTransform and update GPU instance
       this.dummyTransform.position.copy(vehicle.position);
       this.dummyTransform.quaternion.copy(vehicle.quaternion);
       this.dummyTransform.scale.set(1, 1, 1);
@@ -800,7 +792,6 @@ export class Renderer {
    * 2. Spawns / dispatches vehicle agents along the road network
    */
   onGameTick() {
-    // 1. RCI Building Evolution
     const updatedIndices = this.gameState.simulateStep();
     for (let i = 0; i < updatedIndices.length; i++) {
       const gridIndex = updatedIndices[i];
@@ -824,7 +815,6 @@ export class Renderer {
       );
     }
 
-    // 2. Vehicle Agent Spawning & Route Dispatch
     this._manageVehiclePopulation();
   }
 
@@ -914,11 +904,11 @@ export class Renderer {
 
   /**
    * Starts a Drag-to-Zone / Drag-to-Road / Drag-to-Bulldoze operation
-   * ONLY when holding Shift + Left Click.
+   * ONLY when holding Shift + Left Click directly on the canvas.
    * @param {MouseEvent} event
    */
   onMouseDown(event) {
-    if (event.button !== 0 || !event.shiftKey) {
+    if (event.target !== this.canvas || event.button !== 0 || !event.shiftKey) {
       return;
     }
 
@@ -1072,36 +1062,6 @@ export class Renderer {
         this.hoveredGridCoords.gridZ
       );
       this._updateToolFeedbackColors(canBuildNow);
-    }
-  }
-
-  /**
-   * Handles keyboard shortcuts for tool switching:
-   * - 'R' -> 'road'
-   * - 'Z' -> 'residential'
-   * - 'X' -> 'bulldozer'
-   * @param {KeyboardEvent} event
-   */
-  onKeyDown(event) {
-    const key = event.key.toUpperCase();
-
-    if (key === 'R') {
-      this.currentTool = 'road';
-      console.log('[Tool Switched] Active Tool: road');
-    } else if (key === 'Z') {
-      this.currentTool = 'residential';
-      console.log('[Tool Switched] Active Tool: residential');
-    } else if (key === 'X') {
-      this.currentTool = 'bulldozer';
-      console.log('[Tool Switched] Active Tool: bulldozer');
-    }
-
-    if (this.hoveredGridCoords && (event.shiftKey || this.isDragging)) {
-      const canBuild = this.gameState.canBuild(
-        this.hoveredGridCoords.gridX,
-        this.hoveredGridCoords.gridZ
-      );
-      this._updateToolFeedbackColors(canBuild);
     }
   }
 

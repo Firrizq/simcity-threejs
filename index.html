@@ -3,11 +3,42 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>City Builder — Phase 1</title>
+    <title>City Builder — Phase 6</title>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
     <canvas id="game-canvas"></canvas>
+
+    <!-- Floating Glassmorphic Bottom-Center Toolbar Overlay -->
+    <div id="ui-overlay" aria-label="City Builder Toolbar">
+      <div class="glass-toolbar" role="toolbar">
+        <button
+          type="button"
+          class="tool-btn active"
+          data-tool="residential"
+          aria-pressed="true"
+        >
+          🏠 Zone Residential
+        </button>
+        <button
+          type="button"
+          class="tool-btn"
+          data-tool="road"
+          aria-pressed="false"
+        >
+          🛣️ Build Road
+        </button>
+        <button
+          type="button"
+          class="tool-btn"
+          data-tool="bulldozer"
+          aria-pressed="false"
+        >
+          🚜 Bulldozer
+        </button>
+      </div>
+    </div>
+
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
