@@ -246,7 +246,7 @@ export class Renderer {
   }
 
   /**
-   * Initializes the Phase 5 Web Worker using Vite-compatible `new URL(..., import.meta.url)`
+   * Initializes the Phase 5 Web Worker using Vite's standard `new URL(..., import.meta.url)`
    * and synchronizes the initial road graph.
    * @private
    */
@@ -347,12 +347,14 @@ export class Renderer {
   /**
    * Requests a new A* route from `this.pathWorker` for a given vehicle.
    * @param {object} vehicle
+   * @param {{ allRoads: Array<{x: number, z: number}>, buildingAccessRoads: Array<{x: number, z: number}> }} [cachedEndpoints]
    * @private
    */
-  _requestNewPathForVehicle(vehicle) {
+  _requestNewPathForVehicle(vehicle, cachedEndpoints = null) {
     if (vehicle.waitingForPath) return;
 
-    const { allRoads, buildingAccessRoads } = this._getNavigableRoadEndpoints();
+    const endpoints = cachedEndpoints || this._getNavigableRoadEndpoints();
+    const { allRoads, buildingAccessRoads } = endpoints;
     if (allRoads.length < 2) {
       return;
     }
@@ -396,7 +398,8 @@ export class Renderer {
    * @private
    */
   _manageVehiclePopulation() {
-    const { allRoads } = this._getNavigableRoadEndpoints();
+    const endpoints = this._getNavigableRoadEndpoints();
+    const { allRoads } = endpoints;
 
     // If roads were demolished leaving fewer than 2 road tiles, clear active vehicles
     if (allRoads.length < 2) {
@@ -436,9 +439,9 @@ export class Renderer {
       };
 
       this.dummyTransform.position.copy(vehicle.position);
+      this.dummyTransform.scale.set(1, 1, 1);
       this.dummyTransform.lookAt(vehicle.nextNodePosition);
       vehicle.quaternion.copy(this.dummyTransform.quaternion);
-      this.dummyTransform.scale.set(1, 1, 1);
       this.dummyTransform.updateMatrix();
 
       this.vehicleManager.addInstance(
@@ -448,14 +451,14 @@ export class Renderer {
       );
       this.activeVehicles.push(vehicle);
 
-      this._requestNewPathForVehicle(vehicle);
+      this._requestNewPathForVehicle(vehicle, endpoints);
     }
 
-    // Re-dispatch idle vehicles that finished or lost their path
+    // Re-dispatch idle vehicles that finished or lost their path using the cached endpoints
     for (let i = 0; i < this.activeVehicles.length; i++) {
       const v = this.activeVehicles[i];
       if (!v.waitingForPath && v.path.length === 0) {
-        this._requestNewPathForVehicle(v);
+        this._requestNewPathForVehicle(v, endpoints);
       }
     }
   }
@@ -484,6 +487,17 @@ export class Renderer {
         vehicle.currentGrid = { x: randomRoad.x, z: randomRoad.z };
         const worldPos = this._gridToWorld(randomRoad.x, randomRoad.z);
         vehicle.position.set(worldPos.x, 0.05, worldPos.z);
+
+        // Immediately sync relocated position to the GPU buffer so the vehicle mesh doesn't lag behind
+        this.dummyTransform.position.copy(vehicle.position);
+        this.dummyTransform.quaternion.copy(vehicle.quaternion);
+        this.dummyTransform.scale.set(1, 1, 1);
+        this.dummyTransform.updateMatrix();
+        this.vehicleManager.updateInstance(
+          vehicle.id,
+          this.dummyTransform.matrix,
+          vehicle.color
+        );
       }
       return;
     }
@@ -499,6 +513,18 @@ export class Renderer {
     const nextNode = data.path[1];
     const nextWorld = this._gridToWorld(nextNode.x, nextNode.z);
     vehicle.nextNodePosition.set(nextWorld.x, 0.05, nextWorld.z);
+
+    // Orient toward the first waypoint immediately when the path is assigned
+    this.dummyTransform.position.copy(vehicle.position);
+    this.dummyTransform.scale.set(1, 1, 1);
+    this.dummyTransform.lookAt(vehicle.nextNodePosition);
+    vehicle.quaternion.copy(this.dummyTransform.quaternion);
+    this.dummyTransform.updateMatrix();
+    this.vehicleManager.updateInstance(
+      vehicle.id,
+      this.dummyTransform.matrix,
+      vehicle.color
+    );
   }
 
   /**
@@ -551,6 +577,7 @@ export class Renderer {
 
           // Immediately orient toward the new waypoint so corners are crisp
           this.dummyTransform.position.copy(vehicle.position);
+          this.dummyTransform.scale.set(1, 1, 1);
           this.dummyTransform.lookAt(nextNodePosition);
           vehicle.quaternion.copy(this.dummyTransform.quaternion);
         } else {

@@ -2,15 +2,42 @@
  * @file PathfindingWorker.js
  * @description Dedicated Web Worker for A* (A-Star) pathfinding over a lightweight Uint8Array road graph.
  * Strictly zero DOM or Three.js dependencies — operates purely on raw TypedArrays, grid indices, and coordinates.
+ * Pre-allocates A* working buffers to eliminate per-search garbage collection spikes.
  */
 
 let gridSize = 100;
+let totalCells = gridSize * gridSize;
 
 /**
  * 1D Uint8Array where `1` = navigable road node, `0` = obstacle / empty.
  * @type {Uint8Array}
  */
-let roadGraph = new Uint8Array(gridSize * gridSize);
+let roadGraph = new Uint8Array(totalCells);
+
+// Pre-allocated A* scratch buffers (reused across every FIND_PATH call for zero GC overhead)
+let closedSet = new Uint8Array(totalCells);
+let inOpenSet = new Uint8Array(totalCells);
+let cameFrom = new Int32Array(totalCells);
+let gScore = new Float32Array(totalCells);
+let fScore = new Float32Array(totalCells);
+
+// 4 cardinal directions: North, East, South, West
+const DIR_X = [0, 1, 0, -1];
+const DIR_Z = [-1, 0, 1, 0];
+
+/**
+ * Ensures pre-allocated A* working buffers match the current grid dimensions.
+ * @param {number} newTotal
+ */
+function ensureBuffersCapacity(newTotal) {
+  if (closedSet.length !== newTotal) {
+    closedSet = new Uint8Array(newTotal);
+    inOpenSet = new Uint8Array(newTotal);
+    cameFrom = new Int32Array(newTotal);
+    gScore = new Float32Array(newTotal);
+    fScore = new Float32Array(newTotal);
+  }
+}
 
 /**
  * Converts 2D (x, z) coordinates to a 1D index.
@@ -39,23 +66,24 @@ function isValid(x, z) {
  */
 function updateGraph(uint8Grid, dimensions = 100) {
   gridSize = dimensions;
-  const total = gridSize * gridSize;
+  totalCells = gridSize * gridSize;
+  ensureBuffersCapacity(totalCells);
 
-  if (uint8Grid instanceof Uint8Array && uint8Grid.length === total) {
-    // Directly store or copy the lightweight Uint8Array (1 = road, 0 = obstacle/empty)
-    roadGraph = new Uint8Array(uint8Grid);
+  if (uint8Grid instanceof Uint8Array && uint8Grid.length === totalCells) {
+    // Adopt transferred Uint8Array directly without extra copy
+    roadGraph = uint8Grid;
     return;
   }
 
-  if (roadGraph.length !== total) {
-    roadGraph = new Uint8Array(total);
+  if (roadGraph.length !== totalCells) {
+    roadGraph = new Uint8Array(totalCells);
   } else {
     roadGraph.fill(0);
   }
 
   if (!uint8Grid) return;
 
-  for (let i = 0; i < total; i++) {
+  for (let i = 0; i < totalCells; i++) {
     roadGraph[i] = uint8Grid[i] === 1 ? 1 : 0;
   }
 }
@@ -105,21 +133,17 @@ function findPathAStar(start, target) {
     return [{ x: startX, z: startZ }];
   }
 
-  const totalCells = gridSize * gridSize;
-  const closedSet = new Uint8Array(totalCells);
-  const inOpenSet = new Uint8Array(totalCells);
-  const cameFrom = new Int32Array(totalCells).fill(-1);
-  const gScore = new Float32Array(totalCells).fill(Infinity);
-  const fScore = new Float32Array(totalCells).fill(Infinity);
+  // Reset pre-allocated scratch buffers in native C++/WASM speed
+  closedSet.fill(0);
+  inOpenSet.fill(0);
+  cameFrom.fill(-1);
+  gScore.fill(Infinity);
+  fScore.fill(Infinity);
 
   const openList = [startIndex];
   inOpenSet[startIndex] = 1;
   gScore[startIndex] = 0;
   fScore[startIndex] = heuristic(startX, startZ, targetX, targetZ);
-
-  // 4 cardinal directions: North, East, South, West
-  const dirX = [0, 1, 0, -1];
-  const dirZ = [-1, 0, 1, 0];
 
   while (openList.length > 0) {
     // Find node in openList with lowest fScore
@@ -164,8 +188,8 @@ function findPathAStar(start, target) {
 
     // Explore 4 cardinal neighbors
     for (let d = 0; d < 4; d++) {
-      const nx = currX + dirX[d];
-      const nz = currZ + dirZ[d];
+      const nx = currX + DIR_X[d];
+      const nz = currZ + DIR_Z[d];
 
       if (!isValid(nx, nz)) continue;
 

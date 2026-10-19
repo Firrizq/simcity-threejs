@@ -1,7 +1,7 @@
 /**
  * @file GameState.js
  * @description Manages a 1D Flat Array for the 2D city grid, procedural RCI simulation ticks,
- * 4-bit cardinal auto-tiling (bitmasking) for road networks, and lightweight Uint8Array
+ * 4-bit cardinal auto-tiling (bitmasking) for road networks, and O(1) Uint8Array
  * serialization for Web Worker IPC.
  * Strictly NO Three.js imports here.
  */
@@ -17,7 +17,7 @@ export class GameState {
     this.grid = new Array(size * size).fill(null);
 
     /**
-     * Reusable flat Uint8Array buffer for zero-overhead IPC road graph serialization.
+     * Live O(1) flat Uint8Array mirror of navigable roads for fast IPC cloning.
      * 1 = navigable road, 0 = empty / obstacle.
      * @type {Uint8Array}
      */
@@ -53,6 +53,21 @@ export class GameState {
       return -1;
     }
     return z * this.size + x;
+  }
+
+  /**
+   * Converts a 1D flat array index back into 2D `{ x, z }` coordinates.
+   * @param {number} index
+   * @returns {{ x: number, z: number } | null}
+   */
+  getCoords(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.grid.length) {
+      return null;
+    }
+    return {
+      x: index % this.size,
+      z: Math.floor(index / this.size),
+    };
   }
 
   /**
@@ -141,18 +156,12 @@ export class GameState {
   }
 
   /**
-   * Maps `this.grid` into a lightweight `Uint8Array` where `1` = navigable road
-   * and `0` = obstacle/empty. Avoids cloning heavy JS objects across the Worker IPC boundary.
+   * Returns a lightweight `Uint8Array` snapshot (`1` = navigable road, `0` = obstacle/empty)
+   * using native TypedArray copy (`slice()`) in O(1) native memory copy time.
    * @returns {Uint8Array}
    */
   toNavigableUint8Array() {
-    const total = this.grid.length;
-    const roadArray = new Uint8Array(total);
-    for (let i = 0; i < total; i++) {
-      const cell = this.grid[i];
-      roadArray[i] = cell !== null && cell.type === 'road' ? 1 : 0;
-    }
-    return roadArray;
+    return this._roadMaskBuffer.slice();
   }
 
   /**
