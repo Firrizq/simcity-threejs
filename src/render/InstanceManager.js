@@ -1,7 +1,7 @@
 /**
  * @file InstanceManager.js
  * @description Wraps THREE.InstancedMesh and implements O(1) Swap-and-Pop
- * instance insertion and removal using 2-way lookup maps.
+ * instance insertion, in-place tier updates, and removal using 2-way lookup maps.
  */
 
 import * as THREE from 'three';
@@ -26,7 +26,7 @@ export class InstanceManager {
     this._lastColor = new THREE.Color();
     this._tempColor = new THREE.Color();
 
-    // Create unit cube geometry with pivot at the base (y = 0) so cubes sit flush on the grid
+    // Create unit cube geometry with pivot at the base (y = 0) so Y-scaling grows upward from the ground
     const cubeSize = GRID_SIZE * 0.9;
     this.geometry = new THREE.BoxGeometry(cubeSize, GRID_SIZE, cubeSize);
     this.geometry.translate(0, GRID_SIZE / 2, 0);
@@ -37,28 +37,31 @@ export class InstanceManager {
       metalness: 0.1,
     });
 
-    this.instancedMesh = new THREE.InstancedMesh(
+    this.mesh = new THREE.InstancedMesh(
       this.geometry,
       this.material,
       this.maxInstances
     );
-    this.instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    this.instancedMesh.castShadow = true;
-    this.instancedMesh.receiveShadow = true;
-    this.instancedMesh.frustumCulled = false;
+    // Keep alias for backward compatibility
+    this.instancedMesh = this.mesh;
+
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.castShadow = true;
+    this.mesh.receiveShadow = true;
+    this.mesh.frustumCulled = false;
 
     // Initialize the instanceColor buffer upfront so setColorAt/getColorAt always work cleanly
     const defaultColor = new THREE.Color(0xffffff);
     for (let i = 0; i < this.maxInstances; i++) {
-      this.instancedMesh.setColorAt(i, defaultColor);
+      this.mesh.setColorAt(i, defaultColor);
     }
-    if (this.instancedMesh.instanceColor) {
-      this.instancedMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    if (this.mesh.instanceColor) {
+      this.mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
     }
 
     // Start with 0 rendered instances
-    this.instancedMesh.count = 0;
-    this.scene.add(this.instancedMesh);
+    this.mesh.count = 0;
+    this.scene.add(this.mesh);
   }
 
   /**
@@ -79,7 +82,7 @@ export class InstanceManager {
     const instanceId = this.count;
 
     // Write transform matrix
-    this.instancedMesh.setMatrixAt(instanceId, matrix);
+    this.mesh.setMatrixAt(instanceId, matrix);
 
     // Write color
     if (color instanceof THREE.Color) {
@@ -87,7 +90,7 @@ export class InstanceManager {
     } else {
       this._tempColor.set(color);
     }
-    this.instancedMesh.setColorAt(instanceId, this._tempColor);
+    this.mesh.setColorAt(instanceId, this._tempColor);
 
     // Record 2-way binding
     this.gridIndexToInstanceId.set(gridIndex, instanceId);
@@ -95,12 +98,42 @@ export class InstanceManager {
 
     // Increment active instance count
     this.count++;
-    this.instancedMesh.count = this.count;
+    this.mesh.count = this.count;
 
     // Flag GPU buffers for upload
-    this.instancedMesh.instanceMatrix.needsUpdate = true;
-    if (this.instancedMesh.instanceColor) {
-      this.instancedMesh.instanceColor.needsUpdate = true;
+    this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) {
+      this.mesh.instanceColor.needsUpdate = true;
+    }
+
+    return true;
+  }
+
+  /**
+   * Updates an existing instance's matrix and color in O(1) time when a building evolves tiers.
+   * @param {number} gridIndex - 1D index from GameState
+   * @param {THREE.Matrix4} matrix - Updated world transform matrix
+   * @param {THREE.Color | number | string} color - Updated color
+   * @returns {boolean}
+   */
+  updateInstance(gridIndex, matrix, color) {
+    const id = this.gridIndexToInstanceId.get(gridIndex);
+    if (id === undefined) {
+      return false;
+    }
+
+    this.mesh.setMatrixAt(id, matrix);
+
+    if (color instanceof THREE.Color) {
+      this._tempColor.copy(color);
+    } else {
+      this._tempColor.set(color);
+    }
+    this.mesh.setColorAt(id, this._tempColor);
+
+    this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) {
+      this.mesh.instanceColor.needsUpdate = true;
     }
 
     return true;
@@ -126,13 +159,13 @@ export class InstanceManager {
       const lastGridIndex = this.instanceIdToGridIndex.get(lastInstanceId);
 
       // Copy matrix from lastInstanceId -> instanceIdToRemove
-      this.instancedMesh.getMatrixAt(lastInstanceId, this._lastMatrix);
-      this.instancedMesh.setMatrixAt(instanceIdToRemove, this._lastMatrix);
+      this.mesh.getMatrixAt(lastInstanceId, this._lastMatrix);
+      this.mesh.setMatrixAt(instanceIdToRemove, this._lastMatrix);
 
       // Copy color from lastInstanceId -> instanceIdToRemove
-      if (this.instancedMesh.instanceColor) {
-        this.instancedMesh.getColorAt(lastInstanceId, this._lastColor);
-        this.instancedMesh.setColorAt(instanceIdToRemove, this._lastColor);
+      if (this.mesh.instanceColor) {
+        this.mesh.getColorAt(lastInstanceId, this._lastColor);
+        this.mesh.setColorAt(instanceIdToRemove, this._lastColor);
       }
 
       // Update 2-way binding maps for the swapped tail element
@@ -145,12 +178,12 @@ export class InstanceManager {
     this.instanceIdToGridIndex.delete(lastInstanceId);
 
     this.count--;
-    this.instancedMesh.count = this.count;
+    this.mesh.count = this.count;
 
     // Flag GPU buffers for upload
-    this.instancedMesh.instanceMatrix.needsUpdate = true;
-    if (this.instancedMesh.instanceColor) {
-      this.instancedMesh.instanceColor.needsUpdate = true;
+    this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) {
+      this.mesh.instanceColor.needsUpdate = true;
     }
 
     return true;

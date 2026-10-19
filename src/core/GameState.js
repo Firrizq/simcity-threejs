@@ -1,6 +1,6 @@
 /**
  * @file GameState.js
- * @description Manages a 1D Flat Array for the 2D city grid.
+ * @description Manages a 1D Flat Array for the 2D city grid and procedural RCI simulation ticks.
  * Strictly NO Three.js imports here.
  */
 
@@ -61,19 +61,20 @@ export class GameState {
   }
 
   /**
-   * Places a zone/building in the 1D flat grid array at (x, z).
+   * Places a zone in the 1D flat grid array at (x, z), initialized at Tier 0 (empty zoned plot).
    * @param {number} x
    * @param {number} z
-   * @param {string | object} [type='building']
+   * @param {string} [type='residential']
    * @returns {boolean} True if placed, false if invalid or occupied
    */
-  buildZone(x, z, type = 'building') {
+  buildZone(x, z, type = 'residential') {
     if (!this.canBuild(x, z)) {
       return false;
     }
     const index = this.getIndex(x, z);
     this.grid[index] = {
       type,
+      tier: 0,
       x,
       z,
       createdAt: Date.now(),
@@ -97,5 +98,27 @@ export class GameState {
     }
     this.grid[index] = null;
     return true;
+  }
+
+  /**
+   * Runs one simulation tick over the entire 1D grid array.
+   * Any zoned cell with tier < 3 has a 10% probability to evolve to the next tier.
+   * @returns {number[]} Array of `gridIndex` numbers that changed tiers during this tick
+   */
+  simulateStep() {
+    const updatedIndices = [];
+    const totalCells = this.grid.length;
+
+    for (let i = 0; i < totalCells; i++) {
+      const cell = this.grid[i];
+      if (cell !== null && cell.tier < 3) {
+        if (Math.random() < 0.1) {
+          cell.tier += 1;
+          updatedIndices.push(i);
+        }
+      }
+    }
+
+    return updatedIndices;
   }
 }

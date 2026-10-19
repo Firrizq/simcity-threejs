@@ -1,8 +1,8 @@
 /**
  * @file Renderer.js
  * @description Manages Three.js Scene, PerspectiveCamera, WebGLRenderer, Lighting,
- * MapControls, Raycaster, Grid Snapping Cursor, Drag-to-Zone Overlay, and coordinates
- * GameState + InstanceManager.
+ * MapControls, Raycaster, Grid Snapping Cursor, Drag-to-Zone Overlay, and the
+ * Phase 3 Procedural Evolution (RCI) visual simulation tick loop.
  */
 
 import * as THREE from 'three';
@@ -34,18 +34,19 @@ export class Renderer {
     // Reusable objects for matrix composition and raycasting
     this.raycaster = new THREE.Raycaster();
     this.mouse = new THREE.Vector2();
-    this._dummy = new THREE.Object3D();
+    this.dummyTransform = new THREE.Object3D();
     this._buildingColor = new THREE.Color();
 
     // Track current snapped grid coordinates under the cursor
     this.hoveredGridCoords = null;
 
-    // Bind event listeners and animation loop to `this`
+    // Bind event listeners and loops to `this`
     this.onWindowResize = this.onWindowResize.bind(this);
     this.onMouseMove = this.onMouseMove.bind(this);
     this.onMouseDown = this.onMouseDown.bind(this);
     this.onMouseUp = this.onMouseUp.bind(this);
     this.onKeyUp = this.onKeyUp.bind(this);
+    this.onGameTick = this.onGameTick.bind(this);
     this.animate = this.animate.bind(this);
 
     // Initialize subsystems
@@ -60,7 +61,9 @@ export class Renderer {
 
     // Instantiate core GameState and InstancedMesh manager
     this.gameState = new GameState(GRID_DIMENSIONS);
-    this.instanceManager = new InstanceManager(this.scene, MAX_BUILDINGS);
+    this.buildingManager = new InstanceManager(this.scene, MAX_BUILDINGS);
+    // Keep alias `instanceManager` so both names work seamlessly
+    this.instanceManager = this.buildingManager;
 
     // Register DOM event listeners
     window.addEventListener('resize', this.onWindowResize);
@@ -69,7 +72,10 @@ export class Renderer {
     window.addEventListener('mouseup', this.onMouseUp);
     window.addEventListener('keyup', this.onKeyUp);
 
-    // Start render loop
+    // Start Phase 3 Simulation Tick Loop (1 tick per second)
+    this.tickInterval = setInterval(() => this.onGameTick(), 1000);
+
+    // Start WebGL render loop
     this.animate();
   }
 
@@ -161,7 +167,7 @@ export class Renderer {
     );
     this.scene.add(this.gridHelper);
 
-    // Invisible ground plane for raycasting
+    // Invisible ground plane for raycasting (also receives shadows visually via a subtle base plane)
     const planeGeometry = new THREE.PlaneGeometry(this.worldSize, this.worldSize);
     planeGeometry.rotateX(-Math.PI / 2);
 
@@ -222,6 +228,84 @@ export class Renderer {
     );
     this.dragOverlayMesh.visible = false;
     this.scene.add(this.dragOverlayMesh);
+  }
+
+  /**
+   * Computes `this.dummyTransform` matrix and `this._buildingColor` for a given
+   * world position and building tier (0..3).
+   *
+   * - Tier 0 (Zoned/Empty): Scale Y = 0.1
+   * - Tier 1 (Small): Scale Y = 1.0 + Math.random() * 0.5
+   * - Tier 2 (Medium): Scale Y = 2.0 + Math.random() * 1.0
+   * - Tier 3 (High-density): Scale Y = 4.0 + Math.random() * 2.0
+   *
+   * @param {number} worldX
+   * @param {number} worldZ
+   * @param {number} tier
+   * @private
+   */
+  _computeTierTransformAndColor(worldX, worldZ, tier) {
+    let scaleY = 0.1;
+
+    if (tier === 0) {
+      scaleY = 0.1;
+      // Tier 0: Muted green zoned plot pad
+      this._buildingColor.setHSL(0.38, 0.45, 0.35);
+    } else if (tier === 1) {
+      scaleY = 1.0 + Math.random() * 0.5;
+      // Tier 1: Low-density residential/commercial (soft teal-blue)
+      this._buildingColor.setHSL(0.54, 0.55, 0.48);
+    } else if (tier === 2) {
+      scaleY = 2.0 + Math.random() * 1.0;
+      // Tier 2: Medium-density (more saturated & brighter sky-cyan)
+      this._buildingColor.setHSL(0.56, 0.72, 0.6);
+    } else {
+      scaleY = 4.0 + Math.random() * 2.0;
+      // Tier 3: High-density skyscraper (vibrant, bright sunlit tower)
+      this._buildingColor.setHSL(0.58, 0.85, 0.74);
+    }
+
+    this.dummyTransform.position.set(worldX, 0, worldZ);
+    this.dummyTransform.rotation.set(0, 0, 0);
+    this.dummyTransform.scale.set(1, scaleY, 1);
+    this.dummyTransform.updateMatrix();
+  }
+
+  /**
+   * Phase 3 Simulation Tick Handler (runs once per second).
+   * Queries GameState for evolved cell indices and updates only those instances on the GPU.
+   */
+  onGameTick() {
+    const updatedIndices = this.gameState.simulateStep();
+    if (updatedIndices.length === 0) {
+      return;
+    }
+
+    for (let i = 0; i < updatedIndices.length; i++) {
+      const gridIndex = updatedIndices[i];
+      const cell = this.gameState.grid[gridIndex];
+      if (!cell) {
+        continue;
+      }
+
+      // Mathematically reverse 1D gridIndex back to 2D (gridX, gridZ)
+      const gridX = gridIndex % GRID_DIMENSIONS;
+      const gridZ = Math.floor(gridIndex / GRID_DIMENSIONS);
+
+      // Convert 2D grid coordinates to 3D World Coordinates
+      const worldX = gridX * GRID_SIZE - this.halfWorldSize + GRID_SIZE / 2;
+      const worldZ = gridZ * GRID_SIZE - this.halfWorldSize + GRID_SIZE / 2;
+
+      // Update dummyTransform and color based on the cell's new tier
+      this._computeTierTransformAndColor(worldX, worldZ, cell.tier);
+
+      // Update the GPU instance in O(1) time
+      this.buildingManager.updateInstance(
+        gridIndex,
+        this.dummyTransform.matrix,
+        this._buildingColor
+      );
+    }
   }
 
   /**
@@ -359,8 +443,8 @@ export class Renderer {
   }
 
   /**
-   * Finalizes the Drag-to-Zone selection on mouse up, populates buildings in
-   * GameState and InstanceManager, and unlocks MapControls.
+   * Finalizes the Drag-to-Zone selection on mouse up, registers newly zoned areas
+   * at Tier 0 (Scale Y = 0.1 flat ground plot), and unlocks MapControls.
    * @param {MouseEvent} event
    */
   onMouseUp(event) {
@@ -392,29 +476,22 @@ export class Renderer {
 
         if (this.currentTool === 'demolish') {
           if (this.gameState.removeZone(x, z)) {
-            this.instanceManager.removeInstance(gridIndex);
+            this.buildingManager.removeInstance(gridIndex);
           }
         } else {
-          // Default 'build' tool: check gameState.canBuild and place zone + instance
+          // Default 'build' tool: check gameState.canBuild and register as Tier 0 flat plot
           if (this.gameState.canBuild(x, z)) {
             const built = this.gameState.buildZone(x, z, this.currentTool);
             if (built) {
               const worldX = x * GRID_SIZE - this.halfWorldSize + GRID_SIZE / 2;
               const worldZ = z * GRID_SIZE - this.halfWorldSize + GRID_SIZE / 2;
 
-              this._dummy.position.set(worldX, 0, worldZ);
-              this._dummy.rotation.set(0, 0, 0);
-              this._dummy.scale.set(1, 1, 1);
-              this._dummy.updateMatrix();
+              // Register initially at Tier 0 (Scale Y = 0.1 flat ground plot)
+              this._computeTierTransformAndColor(worldX, worldZ, 0);
 
-              this._buildingColor.setHSL(
-                ((x * 13 + z * 29) % 360) / 360,
-                0.65,
-                0.6
-              );
-              this.instanceManager.addInstance(
+              this.buildingManager.addInstance(
                 gridIndex,
-                this._dummy.matrix,
+                this.dummyTransform.matrix,
                 this._buildingColor
               );
             }
