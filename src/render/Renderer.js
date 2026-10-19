@@ -316,12 +316,12 @@ export class Renderer {
   }
 
   /**
-   * Phase 7 Continuous Curve Offsetting:
-   * 1. Constructs the center `THREE.CatmullRomCurve3` FIRST from the raw grid path points.
-   * 2. Extracts 50 high-resolution points from the center curve via `centerCurve.getPoints(50)`.
-   * 3. Iterates through those 50 points, computes the normalized left-perpendicular tangent
-   *    (`px = -dz`, `pz = dx`), applies the `0.25` offset, and constructs a NEW
-   *    `THREE.CatmullRomCurve3` from the offset points so corners remain smoothly parallel without compression.
+   * Phase 7 Stable Lane Offset Curve:
+   * 1. Creates a `CatmullRomCurve3` from the raw center coordinates FIRST.
+   * 2. Samples evenly spaced points via `centerCurve.getSpacedPoints(rawGridPath.length * 2)`.
+   * 3. Iterates through `centerPoints`, calculates the 2D tangent to the next point,
+   *    computes the perpendicular normal `(-dz, dx)`, and applies the `0.25` offset.
+   * 4. Creates the final `CatmullRomCurve3` from those offset points.
    *
    * @param {Array<{ x: number, z: number }>} rawGridPath
    * @returns {{ curve: THREE.CatmullRomCurve3, totalLength: number } | null}
@@ -332,28 +332,28 @@ export class Renderer {
       return null;
     }
 
-    // 1. Create the center CatmullRomCurve3 first from raw grid points
-    const centerWorldPoints = [];
+    // 1. Create a CatmullRomCurve3 from the raw center coordinates FIRST
+    const rawCenterPoints = [];
     for (let i = 0; i < rawGridPath.length; i++) {
       const w = this._gridToWorld(rawGridPath[i].x, rawGridPath[i].z);
-      centerWorldPoints.push(new THREE.Vector3(w.x, 0.05, w.z));
+      rawCenterPoints.push(new THREE.Vector3(w.x, 0.05, w.z));
     }
 
-    const centerCurve = new THREE.CatmullRomCurve3(centerWorldPoints);
+    const centerCurve = new THREE.CatmullRomCurve3(rawCenterPoints);
 
-    // 2. Sample 50 high-resolution points along the center curve
-    const sampledPoints = centerCurve.getPoints(50);
+    // 2. Sample evenly spaced points from this center curve
+    const centerPoints = centerCurve.getSpacedPoints(rawGridPath.length * 2);
 
-    // 3. Compute the left-perpendicular tangent (-dz, dx) at each high-res point and apply 0.25 offset
+    // 3. Iterate through centerPoints, calculate 2D tangent to the next point, and apply (-dz, dx) * 0.25 offset
     const offsetPoints = [];
     let lastPx = 0;
     let lastPz = 0;
 
-    for (let i = 0; i < sampledPoints.length; i++) {
-      const A = sampledPoints[i].clone();
+    for (let i = 0; i < centerPoints.length; i++) {
+      const A = centerPoints[i].clone();
 
-      if (i < sampledPoints.length - 1) {
-        const B = sampledPoints[i + 1];
+      if (i < centerPoints.length - 1) {
+        const B = centerPoints[i + 1];
 
         let dx = B.x - A.x;
         let dz = B.z - A.z;
@@ -364,7 +364,6 @@ export class Renderer {
           dz /= length;
         }
 
-        // Left-perpendicular tangent vector: (-dz, dx)
         const px = -dz;
         const pz = dx;
 
@@ -374,7 +373,6 @@ export class Renderer {
         A.x += px * 0.25;
         A.z += pz * 0.25;
       } else {
-        // Apply final tangent perpendicular offset to the last sampled point
         A.x += lastPx * 0.25;
         A.z += lastPz * 0.25;
       }
@@ -382,11 +380,11 @@ export class Renderer {
       offsetPoints.push(A);
     }
 
-    // 4. Construct a NEW CatmullRomCurve3 from the high-res offset points
-    const offsetCurve = new THREE.CatmullRomCurve3(offsetPoints);
-    const totalLength = Math.max(0.01, offsetCurve.getLength());
+    // 4. Create the final CatmullRomCurve3 from these offset points
+    const finalCurve = new THREE.CatmullRomCurve3(offsetPoints);
+    const totalLength = Math.max(0.01, finalCurve.getLength());
 
-    return { curve: offsetCurve, totalLength };
+    return { curve: finalCurve, totalLength };
   }
 
   /**
@@ -548,8 +546,8 @@ export class Renderer {
   }
 
   /**
-   * Receives `PATH_RESULT` messages from `PathfindingWorker.js`, builds the high-res LHT offset
-   * `THREE.CatmullRomCurve3` ONCE, stores `vehicle.targetNodeString`, and initializes `vehicle.t = 0`.
+   * Receives `PATH_RESULT` messages from `PathfindingWorker.js`, builds the stable LHT offset
+   * `THREE.CatmullRomCurve3` ONCE, and initializes `vehicle.t = 0`.
    * @param {MessageEvent} event
    */
   onWorkerMessage(event) {
@@ -595,7 +593,7 @@ export class Renderer {
     const startNode = data.path[0];
     vehicle.currentGrid = { x: startNode.x, z: startNode.z };
 
-    // Evaluate initial position and tangent at t = 0 along the high-res offset CatmullRomCurve3
+    // Evaluate initial position and tangent at t = 0 along the offset CatmullRomCurve3
     vehicle.curve.getPointAt(0, vehicle.dummy.position);
     vehicle.curve.getTangentAt(0, vehicle.tangent);
 
@@ -612,9 +610,13 @@ export class Renderer {
 
   /**
    * Phase 7 Animation Loop for Vehicles (`requestAnimationFrame`):
-   * 1. Curve-Based Braking: Compares `v1` and `v2` sharing the exact same `targetNodeString`.
-   *    If `v2.t > v1.t` AND `(v2.t - v1.t) < (0.8 / v1.curveLength)`, sets `v1.currentSpeed = 0` (Brake).
-   *    Else sets `v1.currentSpeed = v1.maxSpeed`.
+   * 1. Curve Tangent + Distance Collision Detection:
+   *    - `dist = v1.dummy.position.distanceTo(v2.dummy.position)`
+   *    - If `dist < 1.2 && dist > 0.001`:
+   *      - `dirToV2 = v2.dummy.position.clone().sub(v1.dummy.position).normalize()`
+   *      - `forward = v1.tangent.clone().normalize()`
+   *      - `dot = forward.dot(dirToV2)`
+   *      - If `dot > 0.65`: `v1.currentSpeed = 0; shouldBrake = true; break;`
    * 2. Advances `v1.t` along `v1.curve` (`CatmullRomCurve3`) using `v1.currentSpeed`.
    * 3. Updates `v1.dummy.position` via `curve.getPointAt(t)` and orientation via `curve.getTangentAt(t)` + `lookAt`.
    * @param {number} dt - Frame delta time in seconds
@@ -623,31 +625,37 @@ export class Renderer {
   _updateVehicles(dt) {
     if (this.activeVehicles.length === 0) return;
 
-    // Step 1: Curve-Based Braking (T-parameter collision detection)
+    // Step 1: Curve Tangent + Physical Distance Collision Detection
     for (let i = 0; i < this.activeVehicles.length; i++) {
       const v1 = this.activeVehicles[i];
-      if (!v1.curve || !v1.targetNodeString) continue;
+      if (!v1.curve) continue;
 
       let shouldBrake = false;
-      const safeThresholdT = 0.8 / v1.curveLength;
+      const forward = v1.tangent.clone().normalize();
 
       for (let j = 0; j < this.activeVehicles.length; j++) {
         if (i === j) continue;
 
         const v2 = this.activeVehicles[j];
-        if (!v2.curve || v1.targetNodeString !== v2.targetNodeString) {
-          continue;
-        }
+        if (!v2.curve) continue;
 
-        if (v2.t > v1.t && v2.t - v1.t < safeThresholdT) {
-          shouldBrake = true;
-          break;
+        const dist = v1.dummy.position.distanceTo(v2.dummy.position);
+        if (dist < 1.2 && dist > 0.001) {
+          const dirToV2 = v2.dummy.position
+            .clone()
+            .sub(v1.dummy.position)
+            .normalize();
+          const dot = forward.dot(dirToV2);
+
+          if (dot > 0.65) {
+            v1.currentSpeed = 0;
+            shouldBrake = true;
+            break;
+          }
         }
       }
 
-      if (shouldBrake) {
-        v1.currentSpeed = 0;
-      } else {
+      if (!shouldBrake) {
         v1.currentSpeed = v1.maxSpeed;
       }
     }
