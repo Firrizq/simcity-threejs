@@ -1,7 +1,7 @@
 /**
  * @file InstanceManager.js
  * @description Wraps THREE.InstancedMesh and implements O(1) Swap-and-Pop
- * instance insertion, in-place tier updates, and removal using 2-way lookup maps.
+ * instance insertion, in-place updates, and removal using 2-way lookup maps.
  */
 
 import * as THREE from 'three';
@@ -11,8 +11,15 @@ export class InstanceManager {
   /**
    * @param {THREE.Scene} scene
    * @param {number} [maxInstances=MAX_BUILDINGS]
+   * @param {THREE.BufferGeometry} [customGeometry=null]
+   * @param {THREE.Material} [customMaterial=null]
    */
-  constructor(scene, maxInstances = MAX_BUILDINGS) {
+  constructor(
+    scene,
+    maxInstances = MAX_BUILDINGS,
+    customGeometry = null,
+    customMaterial = null
+  ) {
     this.scene = scene;
     this.maxInstances = maxInstances;
     this.count = 0;
@@ -26,16 +33,24 @@ export class InstanceManager {
     this._lastColor = new THREE.Color();
     this._tempColor = new THREE.Color();
 
-    // Create unit cube geometry with pivot at the base (y = 0) so Y-scaling grows upward from the ground
-    const cubeSize = GRID_SIZE * 0.9;
-    this.geometry = new THREE.BoxGeometry(cubeSize, GRID_SIZE, cubeSize);
-    this.geometry.translate(0, GRID_SIZE / 2, 0);
+    if (customGeometry) {
+      this.geometry = customGeometry;
+    } else {
+      // Default building cube geometry with pivot at the base (y = 0)
+      const cubeSize = GRID_SIZE * 0.9;
+      this.geometry = new THREE.BoxGeometry(cubeSize, GRID_SIZE, cubeSize);
+      this.geometry.translate(0, GRID_SIZE / 2, 0);
+    }
 
-    this.material = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.6,
-      metalness: 0.1,
-    });
+    if (customMaterial) {
+      this.material = customMaterial;
+    } else {
+      this.material = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.6,
+        metalness: 0.1,
+      });
+    }
 
     this.mesh = new THREE.InstancedMesh(
       this.geometry,
@@ -65,7 +80,7 @@ export class InstanceManager {
   }
 
   /**
-   * Adds a new building instance in O(1) time.
+   * Adds a new instance in O(1) time.
    * @param {number} gridIndex - 1D index from GameState
    * @param {THREE.Matrix4} matrix - World transform matrix for the instance
    * @param {THREE.Color | number | string} [color=0x38bdf8] - Color for the instance
@@ -110,10 +125,10 @@ export class InstanceManager {
   }
 
   /**
-   * Updates an existing instance's matrix and color in O(1) time when a building evolves tiers.
+   * Updates an existing instance's matrix and color in O(1) time.
    * @param {number} gridIndex - 1D index from GameState
    * @param {THREE.Matrix4} matrix - Updated world transform matrix
-   * @param {THREE.Color | number | string} color - Updated color
+   * @param {THREE.Color | number | string} [color] - Optional updated color
    * @returns {boolean}
    */
   updateInstance(gridIndex, matrix, color) {
@@ -124,23 +139,24 @@ export class InstanceManager {
 
     this.mesh.setMatrixAt(id, matrix);
 
-    if (color instanceof THREE.Color) {
-      this._tempColor.copy(color);
-    } else {
-      this._tempColor.set(color);
+    if (color !== undefined) {
+      if (color instanceof THREE.Color) {
+        this._tempColor.copy(color);
+      } else {
+        this._tempColor.set(color);
+      }
+      this.mesh.setColorAt(id, this._tempColor);
+      if (this.mesh.instanceColor) {
+        this.mesh.instanceColor.needsUpdate = true;
+      }
     }
-    this.mesh.setColorAt(id, this._tempColor);
 
     this.mesh.instanceMatrix.needsUpdate = true;
-    if (this.mesh.instanceColor) {
-      this.mesh.instanceColor.needsUpdate = true;
-    }
-
     return true;
   }
 
   /**
-   * Removes a building instance in O(1) time using the Swap-and-Pop algorithm.
+   * Removes an instance in O(1) time using the Swap-and-Pop algorithm.
    * Copies the last active instance into the removed instance's slot, updates the 2-way
    * binding maps, and decrements the active instance count.
    * @param {number} gridIndex - 1D index from GameState

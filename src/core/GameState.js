@@ -1,6 +1,7 @@
 /**
  * @file GameState.js
- * @description Manages a 1D Flat Array for the 2D city grid and procedural RCI simulation ticks.
+ * @description Manages a 1D Flat Array for the 2D city grid, procedural RCI simulation ticks,
+ * and 4-bit cardinal auto-tiling (bitmasking) for road networks.
  * Strictly NO Three.js imports here.
  */
 
@@ -47,6 +48,20 @@ export class GameState {
   }
 
   /**
+   * Returns the cell object at (x, z), or null if out of bounds / empty.
+   * @param {number} x
+   * @param {number} z
+   * @returns {object | null}
+   */
+  getCell(x, z) {
+    const index = this.getIndex(x, z);
+    if (index === -1) {
+      return null;
+    }
+    return this.grid[index];
+  }
+
+  /**
    * Checks whether a tile is within bounds and currently empty (null).
    * @param {number} x
    * @param {number} z
@@ -61,7 +76,9 @@ export class GameState {
   }
 
   /**
-   * Places a zone in the 1D flat grid array at (x, z), initialized at Tier 0 (empty zoned plot).
+   * Places a zone or road in the 1D flat grid array at (x, z).
+   * - If `type === 'road'`, initializes a road cell (no `tier`, ignored by RCI growth).
+   * - Otherwise initializes a zone cell at `tier: 0`.
    * @param {number} x
    * @param {number} z
    * @param {string} [type='residential']
@@ -72,18 +89,30 @@ export class GameState {
       return false;
     }
     const index = this.getIndex(x, z);
-    this.grid[index] = {
-      type,
-      tier: 0,
-      x,
-      z,
-      createdAt: Date.now(),
-    };
+
+    if (type === 'road') {
+      this.grid[index] = {
+        type: 'road',
+        x,
+        z,
+        bitmask: 0,
+        createdAt: Date.now(),
+      };
+    } else {
+      this.grid[index] = {
+        type,
+        tier: 0,
+        x,
+        z,
+        createdAt: Date.now(),
+      };
+    }
+
     return true;
   }
 
   /**
-   * Removes a zone/building from the 1D flat grid array at (x, z).
+   * Removes a zone or road from the 1D flat grid array at (x, z).
    * @param {number} x
    * @param {number} z
    * @returns {boolean} True if removed, false if invalid or already empty
@@ -101,8 +130,67 @@ export class GameState {
   }
 
   /**
+   * Checks the 4 cardinal neighbors of (x, z) matching `type` and returns a 4-bit bitmask (0..15):
+   * - North / Top (z - 1)   = 1
+   * - East / Right (x + 1)  = 2
+   * - South / Bottom (z + 1)= 4
+   * - West / Left (x - 1)   = 8
+   *
+   * @param {number} x
+   * @param {number} z
+   * @param {string} [type='road']
+   * @returns {number} Bitmask integer from 0 to 15
+   */
+  getNeighbors(x, z, type = 'road') {
+    let mask = 0;
+
+    // North / Top (z - 1) -> bit 1
+    if (this.isValid(x, z - 1)) {
+      const northCell = this.grid[this.getIndex(x, z - 1)];
+      if (northCell !== null && northCell.type === type) {
+        mask |= 1;
+      }
+    }
+
+    // East / Right (x + 1) -> bit 2
+    if (this.isValid(x + 1, z)) {
+      const eastCell = this.grid[this.getIndex(x + 1, z)];
+      if (eastCell !== null && eastCell.type === type) {
+        mask |= 2;
+      }
+    }
+
+    // South / Bottom (z + 1) -> bit 4
+    if (this.isValid(x, z + 1)) {
+      const southCell = this.grid[this.getIndex(x, z + 1)];
+      if (southCell !== null && southCell.type === type) {
+        mask |= 4;
+      }
+    }
+
+    // West / Left (x - 1) -> bit 8
+    if (this.isValid(x - 1, z)) {
+      const westCell = this.grid[this.getIndex(x - 1, z)];
+      if (westCell !== null && westCell.type === type) {
+        mask |= 8;
+      }
+    }
+
+    // Store updated bitmask on the cell if it matches `type`
+    if (this.isValid(x, z)) {
+      const centerCell = this.grid[this.getIndex(x, z)];
+      if (centerCell !== null && centerCell.type === type) {
+        centerCell.bitmask = mask;
+      }
+    }
+
+    return mask;
+  }
+
+  /**
    * Runs one simulation tick over the entire 1D grid array.
-   * Any zoned cell with tier < 3 has a 10% probability to evolve to the next tier.
+   * Ignores roads (`cell.type === 'road'`). Any zoned RCI cell with tier < 3
+   * has a 10% probability to evolve to the next tier.
    * @returns {number[]} Array of `gridIndex` numbers that changed tiers during this tick
    */
   simulateStep() {
@@ -111,7 +199,12 @@ export class GameState {
 
     for (let i = 0; i < totalCells; i++) {
       const cell = this.grid[i];
-      if (cell !== null && cell.tier < 3) {
+      if (
+        cell !== null &&
+        cell.type !== 'road' &&
+        typeof cell.tier === 'number' &&
+        cell.tier < 3
+      ) {
         if (Math.random() < 0.1) {
           cell.tier += 1;
           updatedIndices.push(i);
