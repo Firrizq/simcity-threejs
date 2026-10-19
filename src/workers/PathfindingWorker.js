@@ -1,12 +1,13 @@
 /**
  * @file PathfindingWorker.js
- * @description Dedicated Web Worker for A* (A-Star) pathfinding over the 1D road grid.
- * Strictly zero DOM or Three.js dependencies — operates purely on grid indices and coordinates.
+ * @description Dedicated Web Worker for A* (A-Star) pathfinding over a lightweight Uint8Array road graph.
+ * Strictly zero DOM or Three.js dependencies — operates purely on raw TypedArrays, grid indices, and coordinates.
  */
 
 let gridSize = 100;
+
 /**
- * 1D Uint8Array where 1 = navigable road node, 0 = non-road
+ * 1D Uint8Array where `1` = navigable road node, `0` = obstacle / empty.
  * @type {Uint8Array}
  */
 let roadGraph = new Uint8Array(gridSize * gridSize);
@@ -32,13 +33,19 @@ function isValid(x, z) {
 }
 
 /**
- * Rebuilds the local navigable road graph from the main thread's 1D grid array.
- * @param {Array<object|null>|Uint8Array} gridData
+ * Updates the local `Uint8Array` navigable road graph from the main thread's lightweight payload.
+ * @param {Uint8Array | ArrayLike<number>} uint8Grid
  * @param {number} [dimensions=100]
  */
-function updateGraph(gridData, dimensions = 100) {
+function updateGraph(uint8Grid, dimensions = 100) {
   gridSize = dimensions;
   const total = gridSize * gridSize;
+
+  if (uint8Grid instanceof Uint8Array && uint8Grid.length === total) {
+    // Directly store or copy the lightweight Uint8Array (1 = road, 0 = obstacle/empty)
+    roadGraph = new Uint8Array(uint8Grid);
+    return;
+  }
 
   if (roadGraph.length !== total) {
     roadGraph = new Uint8Array(total);
@@ -46,13 +53,10 @@ function updateGraph(gridData, dimensions = 100) {
     roadGraph.fill(0);
   }
 
-  if (!gridData) return;
+  if (!uint8Grid) return;
 
   for (let i = 0; i < total; i++) {
-    const cell = gridData[i];
-    if (cell && (cell === 1 || cell.type === 'road')) {
-      roadGraph[i] = 1;
-    }
+    roadGraph[i] = uint8Grid[i] === 1 ? 1 : 0;
   }
 }
 
@@ -69,7 +73,7 @@ function heuristic(x1, z1, x2, z2) {
 }
 
 /**
- * Standard A* (A-Star) shortest path algorithm over navigable road tiles.
+ * Standard A* (A-Star) shortest path algorithm reading directly from the `Uint8Array` roadGraph.
  * Returns an array of `{ x, z }` grid coordinates from `start` to `target` (inclusive),
  * or an empty array if no valid road path exists.
  *
@@ -92,8 +96,8 @@ function findPathAStar(start, target) {
   const startIndex = toIndex(startX, startZ);
   const targetIndex = toIndex(targetX, targetZ);
 
-  // Both start and target must be navigable road tiles
-  if (roadGraph[startIndex] === 0 || roadGraph[targetIndex] === 0) {
+  // Both start and target must be navigable road tiles (value === 1 in Uint8Array)
+  if (roadGraph[startIndex] !== 1 || roadGraph[targetIndex] !== 1) {
     return [];
   }
 
@@ -167,8 +171,8 @@ function findPathAStar(start, target) {
 
       const neighborIndex = toIndex(nx, nz);
 
-      // Must be a road tile and not yet evaluated
-      if (roadGraph[neighborIndex] === 0 || closedSet[neighborIndex] === 1) {
+      // Must be a navigable road tile (1) and not yet in closedSet
+      if (roadGraph[neighborIndex] !== 1 || closedSet[neighborIndex] === 1) {
         continue;
       }
 
@@ -193,7 +197,7 @@ function findPathAStar(start, target) {
 
 /**
  * Worker message handler supporting:
- * - UPDATE_GRAPH: { type: 'UPDATE_GRAPH', grid, dimensions }
+ * - UPDATE_GRAPH: { type: 'UPDATE_GRAPH', grid: Uint8Array, dimensions: number }
  * - FIND_PATH: { type: 'FIND_PATH', vehicleId, start: { x, z }, target: { x, z } }
  */
 self.onmessage = function (event) {

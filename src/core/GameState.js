@@ -1,7 +1,8 @@
 /**
  * @file GameState.js
  * @description Manages a 1D Flat Array for the 2D city grid, procedural RCI simulation ticks,
- * and 4-bit cardinal auto-tiling (bitmasking) for road networks.
+ * 4-bit cardinal auto-tiling (bitmasking) for road networks, and lightweight Uint8Array
+ * serialization for Web Worker IPC.
  * Strictly NO Three.js imports here.
  */
 
@@ -14,6 +15,13 @@ export class GameState {
   constructor(size = GRID_DIMENSIONS) {
     this.size = size;
     this.grid = new Array(size * size).fill(null);
+
+    /**
+     * Reusable flat Uint8Array buffer for zero-overhead IPC road graph serialization.
+     * 1 = navigable road, 0 = empty / obstacle.
+     * @type {Uint8Array}
+     */
+    this._roadMaskBuffer = new Uint8Array(size * size);
   }
 
   /**
@@ -98,6 +106,7 @@ export class GameState {
         bitmask: 0,
         createdAt: Date.now(),
       };
+      this._roadMaskBuffer[index] = 1;
     } else {
       this.grid[index] = {
         type,
@@ -106,6 +115,7 @@ export class GameState {
         z,
         createdAt: Date.now(),
       };
+      this._roadMaskBuffer[index] = 0;
     }
 
     return true;
@@ -126,7 +136,23 @@ export class GameState {
       return false;
     }
     this.grid[index] = null;
+    this._roadMaskBuffer[index] = 0;
     return true;
+  }
+
+  /**
+   * Maps `this.grid` into a lightweight `Uint8Array` where `1` = navigable road
+   * and `0` = obstacle/empty. Avoids cloning heavy JS objects across the Worker IPC boundary.
+   * @returns {Uint8Array}
+   */
+  toNavigableUint8Array() {
+    const total = this.grid.length;
+    const roadArray = new Uint8Array(total);
+    for (let i = 0; i < total; i++) {
+      const cell = this.grid[i];
+      roadArray[i] = cell !== null && cell.type === 'road' ? 1 : 0;
+    }
+    return roadArray;
   }
 
   /**

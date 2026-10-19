@@ -38,6 +38,7 @@ export class Renderer {
     this.dummyTransform = new THREE.Object3D();
     this._buildingColor = new THREE.Color();
     this._roadColor = new THREE.Color();
+    this._moveDirection = new THREE.Vector3();
 
     // Phase 5: Vehicle Agent tracking and constants
     this.activeVehicles = [];
@@ -226,7 +227,7 @@ export class Renderer {
       roadMaterial
     );
 
-    // 3. Vehicle InstanceManager (0.4 x 0.2 x 0.8 BoxGeometry sitting atop road surface y = 0.05)
+    // 3. Vehicle InstanceManager (0.4 width x 0.2 height x 0.8 length along Z-axis so lookAt points the car head along the path)
     const vehicleGeometry = new THREE.BoxGeometry(0.4, 0.2, 0.8);
     vehicleGeometry.translate(0, 0.1, 0);
 
@@ -245,31 +246,48 @@ export class Renderer {
   }
 
   /**
-   * Initializes the Phase 5 Web Worker (`src/workers/PathfindingWorker.js`)
-   * and sends the initial empty graph.
+   * Initializes the Phase 5 Web Worker using Vite-compatible `new URL(..., import.meta.url)`
+   * and synchronizes the initial road graph.
    * @private
    */
   _initPathfindingWorker() {
-    this.pathfindingWorker = new Worker(
+    this.pathWorker = new Worker(
       new URL('../workers/PathfindingWorker.js', import.meta.url),
       { type: 'module' }
     );
-    this.pathfindingWorker.onmessage = this.onWorkerMessage;
+    // Alias for backward compatibility
+    this.pathfindingWorker = this.pathWorker;
+
+    this.pathWorker.onmessage = this.onWorkerMessage;
     this._syncGraphWithWorker();
   }
 
   /**
-   * Sends an `UPDATE_GRAPH` message to the PathfindingWorker with the current 1D grid array.
-   * Called whenever roads are built or demolished.
+   * Maps `this.gameState.grid` into a lightweight `Uint8Array` (`1` for road, `0` for obstacle/empty).
+   * @returns {Uint8Array}
+   * @private
+   */
+  _createNavigableRoadUint8Array() {
+    return this.gameState.toNavigableUint8Array();
+  }
+
+  /**
+   * Sends a single `UPDATE_GRAPH` message to `this.pathWorker` using a lightweight `Uint8Array`
+   * rather than cloning the heavy `GameState.grid` object array.
    * @private
    */
   _syncGraphWithWorker() {
-    if (!this.pathfindingWorker) return;
-    this.pathfindingWorker.postMessage({
-      type: 'UPDATE_GRAPH',
-      grid: this.gameState.grid,
-      dimensions: GRID_DIMENSIONS,
-    });
+    if (!this.pathWorker) return;
+
+    const roadUint8Array = this._createNavigableRoadUint8Array();
+    this.pathWorker.postMessage(
+      {
+        type: 'UPDATE_GRAPH',
+        grid: roadUint8Array,
+        dimensions: GRID_DIMENSIONS,
+      },
+      [roadUint8Array.buffer]
+    );
   }
 
   /**
@@ -327,10 +345,7 @@ export class Renderer {
   }
 
   /**
-   * Requests a new A* route from the Web Worker for a given vehicle.
-   * Prefers routing between buildings (residential <-> commercial/other buildings) when
-   * buildings have road access, and falls back to any two road nodes so vehicles still
-   * drive even if the player has only drawn roads.
+   * Requests a new A* route from `this.pathWorker` for a given vehicle.
    * @param {object} vehicle
    * @private
    */
@@ -367,7 +382,7 @@ export class Renderer {
     }
 
     vehicle.waitingForPath = true;
-    this.pathfindingWorker.postMessage({
+    this.pathWorker.postMessage({
       type: 'FIND_PATH',
       vehicleId: vehicle.id,
       start: validStart,
@@ -377,7 +392,7 @@ export class Renderer {
 
   /**
    * Spawns vehicle agents proportional to the city's road/building network
-   * and dispatches initial path requests to the Web Worker.
+   * and dispatches initial path requests to `this.pathWorker`.
    * @private
    */
   _manageVehiclePopulation() {
@@ -412,8 +427,8 @@ export class Renderer {
         color: new THREE.Color(colorHex),
         currentGrid: { x: spawnRoad.x, z: spawnRoad.z },
         position: new THREE.Vector3(worldPos.x, 0.05, worldPos.z),
-        targetPosition: new THREE.Vector3(worldPos.x, 0.05, worldPos.z),
-        rotationY: 0,
+        nextNodePosition: new THREE.Vector3(worldPos.x, 0.05, worldPos.z + 1),
+        quaternion: new THREE.Quaternion(),
         path: [],
         pathIndex: 0,
         speed: 2.2 + Math.random() * 1.2, // World units per second
@@ -421,7 +436,8 @@ export class Renderer {
       };
 
       this.dummyTransform.position.copy(vehicle.position);
-      this.dummyTransform.rotation.set(0, vehicle.rotationY, 0);
+      this.dummyTransform.lookAt(vehicle.nextNodePosition);
+      vehicle.quaternion.copy(this.dummyTransform.quaternion);
       this.dummyTransform.scale.set(1, 1, 1);
       this.dummyTransform.updateMatrix();
 
@@ -459,7 +475,6 @@ export class Renderer {
     vehicle.waitingForPath = false;
 
     if (!data.path || data.path.length < 2) {
-      // Path unavailable (e.g. disconnected road island); relocate vehicle to a valid road on next tick
       vehicle.path = [];
       vehicle.pathIndex = 0;
       const { allRoads } = this._getNavigableRoadEndpoints();
@@ -483,15 +498,15 @@ export class Renderer {
 
     const nextNode = data.path[1];
     const nextWorld = this._gridToWorld(nextNode.x, nextNode.z);
-    vehicle.targetPosition.set(nextWorld.x, 0.05, nextWorld.z);
+    vehicle.nextNodePosition.set(nextWorld.x, 0.05, nextWorld.z);
   }
 
   /**
    * Updates all active vehicles every frame (`requestAnimationFrame`):
-   * - Linearly interpolates (lerps) 3D position toward the next path node
-   * - Rotates the vehicle to face its movement direction
-   * - Calls `this.vehicleManager.updateInstance(id, matrix, color)`
-   * - Requests a new path from the Worker when a vehicle reaches its final destination
+   * - Calculates movement direction toward `nextNodePosition`
+   * - Orients the vehicle's head along the path using `this.dummyTransform.lookAt(nextNodePosition)`
+   * - Linearly interpolates (lerps) 3D position toward `nextNodePosition`
+   * - Updates GPU via `this.vehicleManager.updateInstance(id, matrix, color)`
    * @param {number} dt - Frame delta time in seconds
    * @private
    */
@@ -504,30 +519,40 @@ export class Renderer {
         continue;
       }
 
-      const dx = vehicle.targetPosition.x - vehicle.position.x;
-      const dz = vehicle.targetPosition.z - vehicle.position.z;
-      const distance = Math.hypot(dx, dz);
+      const nextNodePosition = vehicle.nextNodePosition;
 
+      // Calculate movement direction vector and distance to next path node
+      this._moveDirection.subVectors(nextNodePosition, vehicle.position);
+      const distance = this._moveDirection.length();
+
+      // Orient the vehicle to face `nextNodePosition` before advancing/updating matrix
       if (distance > 0.0001) {
-        // Face movement direction (+Z forward axis of 0.4 x 0.2 x 0.8 box)
-        vehicle.rotationY = Math.atan2(dx, dz);
+        this.dummyTransform.position.copy(vehicle.position);
+        this.dummyTransform.scale.set(1, 1, 1);
+        this.dummyTransform.lookAt(nextNodePosition);
+        vehicle.quaternion.copy(this.dummyTransform.quaternion);
       }
 
       const step = vehicle.speed * dt;
 
       if (step >= distance) {
-        // Snap to reached waypoint node
-        vehicle.position.copy(vehicle.targetPosition);
+        // Reached current waypoint node
+        vehicle.position.copy(nextNodePosition);
         const reachedNode = vehicle.path[vehicle.pathIndex];
         vehicle.currentGrid = { x: reachedNode.x, z: reachedNode.z };
 
         vehicle.pathIndex++;
 
         if (vehicle.pathIndex < vehicle.path.length) {
-          // Advance target to next path node
+          // Advance nextNodePosition to the next waypoint along the curve/path
           const nextNode = vehicle.path[vehicle.pathIndex];
           const nextWorld = this._gridToWorld(nextNode.x, nextNode.z);
-          vehicle.targetPosition.set(nextWorld.x, 0.05, nextWorld.z);
+          nextNodePosition.set(nextWorld.x, 0.05, nextWorld.z);
+
+          // Immediately orient toward the new waypoint so corners are crisp
+          this.dummyTransform.position.copy(vehicle.position);
+          this.dummyTransform.lookAt(nextNodePosition);
+          vehicle.quaternion.copy(this.dummyTransform.quaternion);
         } else {
           // Reached final destination -> clear path and request a new route from Worker
           vehicle.path = [];
@@ -535,14 +560,14 @@ export class Renderer {
           this._requestNewPathForVehicle(vehicle);
         }
       } else {
-        // Smooth linear interpolation toward targetPosition
+        // Smooth linear interpolation (Lerp) toward nextNodePosition
         const alpha = step / distance;
-        vehicle.position.lerp(vehicle.targetPosition, alpha);
+        vehicle.position.lerp(nextNodePosition, alpha);
       }
 
-      // Compose matrix and update GPU instance buffer
+      // Apply final position + lookAt orientation to dummyTransform and update GPU instance
       this.dummyTransform.position.copy(vehicle.position);
-      this.dummyTransform.rotation.set(0, vehicle.rotationY, 0);
+      this.dummyTransform.quaternion.copy(vehicle.quaternion);
       this.dummyTransform.scale.set(1, 1, 1);
       this.dummyTransform.updateMatrix();
 
@@ -925,7 +950,7 @@ export class Renderer {
 
   /**
    * Finalizes the drag selection on mouse up, updates GameState and InstanceManagers,
-   * and sends `UPDATE_GRAPH` to the Web Worker whenever roads are built or demolished.
+   * and fires `UPDATE_GRAPH` strictly ONCE after the entire drag-to-zone loop finishes.
    * @param {MouseEvent} event
    */
   onMouseUp(event) {
@@ -1001,7 +1026,7 @@ export class Renderer {
       }
     }
 
-    // Synchronize road graph with Web Worker whenever a road was placed or demolished
+    // Fire UPDATE_GRAPH strictly ONCE after the entire nested drag loop finishes
     if (roadGraphModified) {
       this._syncGraphWithWorker();
       this._manageVehiclePopulation();
